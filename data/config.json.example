@@ -1,0 +1,8 @@
+{
+  "server_id": "YOUR_SERVER_ID",
+  "cookie": "oc_locale=zh; auth=YOUR_AUTH_COOKIE",
+  "workspace_id": "YOUR_WORKSPACE_ID",
+  "baidu_app_id": "",
+  "baidu_api_key": "",
+  "baidu_secret_key": ""
+}
