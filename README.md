@@ -2,6 +2,12 @@
 
 在 Waveshare ESP32-S3-Touch-AMOLED-2.16 开发板上显示 OpenCode Token 用量的固件。
 
+<img width="307" height="409" alt="1b2b0536bc8ad161e428c0deda3aafb6" src="https://github.com/user-attachments/assets/d59a0a6f-1483-4df2-9ebe-b20832e409ec" />
+<img width="307" height="409" alt="b598914ee3e2701626b0c7eb8ab07a65" src="https://github.com/user-attachments/assets/d649e905-e27e-4900-8f70-dff1deca24a8" />
+
+
+
+
 ## 功能
 
 - 显示 **5小时** / **每周** / **每月** 用量进度条
