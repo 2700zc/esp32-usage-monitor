@@ -126,6 +126,9 @@ pio run -e esp32-usage-monitor -t upload -t uploadfs
 - 每次修改 `config.json` 后需要重新上传文件系统：`pio run -e esp32-usage-monitor -t uploadfs`
 - Cookie 有效期有限，失效后需要从浏览器重新获取并更新配置
 
+## 友情链接
+- 同时还做了一个Windows上的用量显示悬浮窗，地址是：https://github.com/2700zc/TokenHub 配置好了之后，开箱即用
+
 ## License
 
 MIT
