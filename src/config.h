@@ -7,9 +7,8 @@ struct AppConfig {
   char server_id[256];
   char cookie[2048];
   char workspace_id[128];
-  char baidu_app_id[32];
-  char baidu_api_key[64];
-  char baidu_secret_key[64];
+  char pc_host[64];
+  uint16_t pc_port;
   bool valid;
 };
 
@@ -29,9 +28,8 @@ inline bool loadConfig(AppConfig& cfg) {
   strlcpy(cfg.server_id,     doc["server_id"]     | "", sizeof(cfg.server_id));
   strlcpy(cfg.cookie,        doc["cookie"]        | "", sizeof(cfg.cookie));
   strlcpy(cfg.workspace_id,  doc["workspace_id"]  | "", sizeof(cfg.workspace_id));
-  strlcpy(cfg.baidu_app_id,  doc["baidu_app_id"]  | "", sizeof(cfg.baidu_app_id));
-  strlcpy(cfg.baidu_api_key, doc["baidu_api_key"] | "", sizeof(cfg.baidu_api_key));
-  strlcpy(cfg.baidu_secret_key, doc["baidu_secret_key"] | "", sizeof(cfg.baidu_secret_key));
+  strlcpy(cfg.pc_host,      doc["pc_host"]      | "", sizeof(cfg.pc_host));
+  cfg.pc_port = (uint16_t)(doc["pc_port"] | 12345);
   cfg.valid = cfg.server_id[0] != 0;
   return true;
 }
