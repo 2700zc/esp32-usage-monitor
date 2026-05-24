@@ -2,9 +2,11 @@
 #include "hw/pins.h"
 #include <Arduino.h>
 #include <driver/i2s_std.h>
+#include <driver/i2s_common.h>
 #include <Wire.h>
 
 static i2s_chan_handle_t s_rxHandle = nullptr;
+static i2s_chan_handle_t s_txHandle = nullptr;
 static bool s_running = false;
 
 static void es8311WriteReg(uint8_t reg, uint8_t val) {
@@ -76,35 +78,34 @@ static void initEs8311() {
 }
 
 bool audioInit() {
-    i2s_chan_handle_t txHandle = nullptr;
-
     i2s_chan_config_t chanCfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     chanCfg.auto_clear = true;
 
-    esp_err_t err = i2s_new_channel(&chanCfg, &txHandle, &s_rxHandle);
+    esp_err_t err = i2s_new_channel(&chanCfg, &s_txHandle, &s_rxHandle);
     if (err != ESP_OK || !s_rxHandle) {
         Serial.printf("i2s_audio: I2S channel create failed: %s\n", esp_err_to_name(err));
         return false;
     }
 
-    i2s_std_config_t stdCfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(16000),
-        .slot_cfg = I2S_STD_PHILIP_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
-        .gpio_cfg = {
-            .mclk = (gpio_num_t)PIN_I2S_MCLK,
-            .bclk = (gpio_num_t)PIN_I2S_BCLK,
-            .ws   = (gpio_num_t)PIN_I2S_WS,
-            .dout = (gpio_num_t)PIN_I2S_DO,
-            .din  = (gpio_num_t)PIN_I2S_DI,
-            .invert_flags = {
-                .mclk_inv = false,
-                .bclk_inv = false,
-                .ws_inv = false,
-            },
-        },
-    };
+    i2s_std_config_t stdCfg;
+    memset(&stdCfg, 0, sizeof(stdCfg));
+
+    stdCfg.clk_cfg.sample_rate_hz = 16000;
+    stdCfg.clk_cfg.clk_src = I2S_CLK_SRC_DEFAULT;
     stdCfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+    stdCfg.clk_cfg.ext_clk_freq_hz = 0;
+
+    stdCfg.slot_cfg = I2S_STD_PHILIP_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
     stdCfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+
+    stdCfg.gpio_cfg.mclk = (gpio_num_t)PIN_I2S_MCLK;
+    stdCfg.gpio_cfg.bclk = (gpio_num_t)PIN_I2S_BCLK;
+    stdCfg.gpio_cfg.ws   = (gpio_num_t)PIN_I2S_WS;
+    stdCfg.gpio_cfg.dout = (gpio_num_t)PIN_I2S_DO;
+    stdCfg.gpio_cfg.din  = (gpio_num_t)PIN_I2S_DI;
+    stdCfg.gpio_cfg.invert_flags.mclk_inv = false;
+    stdCfg.gpio_cfg.invert_flags.bclk_inv = false;
+    stdCfg.gpio_cfg.invert_flags.ws_inv = false;
 
     err = i2s_channel_init_std_mode(s_rxHandle, &stdCfg);
     if (err != ESP_OK) {

@@ -4,6 +4,8 @@
 #include <WiFiClientSecure.h>
 #include <stdlib.h>
 
+extern "C" void handleHttpStatus();
+
 static int extractIntAfter(const char* str, const char* prefix, const char* key) {
   if (!str || !prefix || !key) return -1;
   const char* p = strstr(str, prefix);
@@ -81,8 +83,14 @@ bool apiFetchUsage(UsageData& out, const char* serverId, const char* cookie, con
   client.println();
 
   uint32_t start = millis();
+  uint32_t lastPoll = 0;
   String response;
   while (millis() - start < 10000) {
+    uint32_t now = millis();
+    if (now - lastPoll >= 100) {
+      handleHttpStatus();
+      lastPoll = now;
+    }
     if (client.available()) {
       char c = client.read();
       response += c;
@@ -90,122 +98,16 @@ bool apiFetchUsage(UsageData& out, const char* serverId, const char* cookie, con
     } else if (!client.connected()) {
       break;
     }
+    delay(1);
   }
   client.stop();
-
-  Serial.printf("API response (%u bytes): %s\n", response.length(), response.c_str());
 
   int bodyIdx = response.indexOf("\r\n\r\n");
   if (bodyIdx < 0) {
-    Serial.println("API: no header separator found");
     return false;
   }
   const char* body = response.c_str() + bodyIdx + 4;
-  Serial.printf("API body: %s\n", body);
 
   parseUsage(body, out);
   return out.valid;
-}
-
-static String s_baiduToken;
-static uint32_t s_tokenExpiry = 0;
-
-static bool getBaiduToken(const char* apiKey, const char* secretKey) {
-  if (s_baiduToken.length() > 0 && millis() < s_tokenExpiry) return true;
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(10000);
-
-  if (!client.connect("aip.baidubce.com", 443)) return false;
-
-  String body = "grant_type=client_credentials&client_id=";
-  body += apiKey;
-  body += "&client_secret=";
-  body += secretKey;
-
-  client.println("POST /oauth/2.0/token HTTP/1.1");
-  client.println("Host: aip.baidubce.com");
-  client.println("Content-Type: application/x-www-form-urlencoded");
-  client.print("Content-Length: ");
-  client.println(body.length());
-  client.println("Connection: close");
-  client.println();
-  client.print(body);
-
-  uint32_t start = millis();
-  String resp;
-  while (millis() - start < 10000) {
-    if (client.available()) { char c = client.read(); resp += c; }
-    else if (!client.connected()) break;
-  }
-  client.stop();
-
-  int bodyIdx = resp.indexOf("\r\n\r\n");
-  if (bodyIdx < 0) return false;
-  const char* json = resp.c_str() + bodyIdx + 4;
-
-  JsonDocument doc;
-  if (deserializeJson(doc, json) != DeserializationError::Ok) return false;
-  const char* token = doc["access_token"];
-  if (!token) return false;
-  s_baiduToken = token;
-  s_tokenExpiry = millis() + 2500000;
-  return true;
-}
-
-bool apiBaiduStt(const uint8_t* audioData, size_t audioLen,
-                 char* textOut, size_t textMax,
-                 const char* apiKey, const char* secretKey) {
-  textOut[0] = 0;
-  if (!audioData || audioLen == 0) return false;
-
-  if (!getBaiduToken(apiKey, secretKey)) return false;
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(15000);
-
-  if (!client.connect("vop.baidu.com", 443)) return false;
-
-  String path = "/server_api?dev_pid=1537&token=";
-  path += s_baiduToken;
-  path += "&cuid=ESP32_USAGE_MONITOR";
-
-  client.print("POST ");
-  client.print(path);
-  client.println(" HTTP/1.1");
-  client.println("Host: vop.baidu.com");
-  client.println("Content-Type: audio/pcm;rate=16000");
-  client.print("Content-Length: ");
-  client.println(audioLen);
-  client.println("Connection: close");
-  client.println();
-  client.write(audioData, audioLen);
-
-  uint32_t start = millis();
-  String resp;
-  while (millis() - start < 15000) {
-    if (client.available()) { char c = client.read(); resp += c; }
-    else if (!client.connected()) break;
-  }
-  client.stop();
-
-  int bodyIdx = resp.indexOf("\r\n\r\n");
-  if (bodyIdx < 0) return false;
-  const char* json = resp.c_str() + bodyIdx + 4;
-
-  JsonDocument doc;
-  if (deserializeJson(doc, json) != DeserializationError::Ok) return false;
-  int errNo = doc["err_no"] | -1;
-  if (errNo != 0) {
-    Serial.printf("Baidu STT error: %d\n", errNo);
-    return false;
-  }
-  JsonArray result = doc["result"];
-  if (result.isNull() || result.size() == 0) return false;
-  const char* text = result[0];
-  if (!text) return false;
-  strlcpy(textOut, text, textMax);
-  return true;
 }

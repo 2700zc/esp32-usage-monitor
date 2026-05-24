@@ -37,7 +37,7 @@ void hwInit() {
   if (!hwInputInit())     die("input");
   if (!hwImuInit())       die("imu");
   if (!hwRtcInit())       die("rtc");
-  if (!hwAudioInit())     die("audio");
+  // audio (hwAudioInit) intentionally skipped — all beeps removed
 
   Serial.println("hwInit OK");
 }
