@@ -191,14 +191,13 @@ void usageDisplayDrawThinking(uint32_t elapsedMs) {
   if (!loadImg555()) { spr.fillScreen(COL_BG); return; }
   spr.fillScreen(COL_BG);
   uint32_t cycle = elapsedMs % 200;
-  bool show = cycle < 100;
-  if (show) {
+  if (cycle < 100) {
     int cx = SAFE_L + SAFE_W / 2;
-    spr.draw16bitRGBBitmap(cx - s_img555W / 2, SAFE_T + 80,
+    spr.draw16bitRGBBitmap(cx - s_img555W / 2, SAFE_T + 50,
                            s_img555, s_img555W, s_img555H);
   }
   spr.setFont(u8g2_font_wqy16_t_gb2312b);
   spr.setTextColor(COL_TEXT);
-  spr.setCursor(SAFE_L + 16, SAFE_T + 120);
+  spr.setCursor(SAFE_L + 16, SAFE_T + 148);
   spr.print("思考中...");
 }

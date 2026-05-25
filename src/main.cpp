@@ -219,10 +219,7 @@ void loop() {
         }
     }
 
-    // Thinking auto-dismiss after 30s
-    if (s_thinking && now - s_thinkingSince > 30000) {
-        s_thinking = false;
-    }
+    // Thinking auto-dismiss: removed per user request — only state=done clears it
 
     // Draw
     if (s_easterState == 1) {
