@@ -106,19 +106,26 @@ void usageDisplayDraw(const UsageData& data, const char* ip) {
 
 static const char* s_weekDays[7] = { "周日", "周一", "周二", "周三", "周四", "周五", "周六" };
 
-static void drawJavaLogo(int cx, int cy) {
-  static uint16_t* s_img = nullptr;
-  if (!s_img) {
-    File f = LittleFS.open("/java.raw", "r");
-    if (!f) return;
-    size_t sz = f.size();
-    s_img = (uint16_t*)malloc(sz);
-    if (!s_img) { f.close(); return; }
-    f.read((uint8_t*)s_img, sz);
-    f.close();
-  }
-  int w = 80, h = 80;
-  spr.draw16bitRGBBitmap(cx - w/2, cy - h/2, s_img, w, h);
+static uint16_t* s_img555 = nullptr;
+static int s_img555W = 0, s_img555H = 0;
+
+static bool loadImg555() {
+  if (s_img555) return true;
+  File f = LittleFS.open("/555.raw", "r");
+  if (!f) return false;
+  size_t sz = f.size();
+  s_img555 = (uint16_t*)malloc(sz);
+  if (!s_img555) { f.close(); return false; }
+  f.read((uint8_t*)s_img555, sz);
+  f.close();
+  s_img555W = 160;
+  s_img555H = 26;
+  return true;
+}
+
+static void drawLogo555(int cx, int cy) {
+  if (!loadImg555()) return;
+  spr.draw16bitRGBBitmap(cx - s_img555W / 2, cy - s_img555H / 2, s_img555, s_img555W, s_img555H);
 }
 
 void usageDisplayDrawTime(const char* ip, bool timeValid) {
@@ -157,7 +164,7 @@ void usageDisplayDrawTime(const char* ip, bool timeValid) {
     spr.setCursor(SAFE_L, 90);
     spr.print(pctBuf);
 
-    drawJavaLogo(SAFE_L + SAFE_W / 2, 145);
+    drawLogo555(SAFE_L + SAFE_W / 2, SAFE_T + SAFE_H - 40);
   }
 
   if (ip && ip[0]) {
@@ -168,55 +175,30 @@ void usageDisplayDrawTime(const char* ip, bool timeValid) {
   }
 }
 
-struct Anim {
-  uint32_t frameCount, delayMs, w, h;
-  uint16_t* pixels;
-};
-
-static Anim s_anim = {0};
-
-static bool loadAnim(const char* path) {
-  if (s_anim.pixels) return true;
-  File f = LittleFS.open(path, "r");
-  if (!f) return false;
-  uint32_t hdr[4];
-  f.read((uint8_t*)hdr, 16);
-  size_t fb = hdr[2] * hdr[3] * 2;
-  size_t total = fb * hdr[0];
-  uint16_t* buf = (uint16_t*)ps_malloc(total);
-  if (!buf) { f.close(); return false; }
-  f.read((uint8_t*)buf, total);
-  f.close();
-  s_anim.frameCount = hdr[0];
-  s_anim.delayMs     = hdr[1];
-  s_anim.w           = hdr[2];
-  s_anim.h           = hdr[3];
-  s_anim.pixels      = buf;
-  return true;
-}
-
-static void drawAnimFrame(int cx, int cy, uint32_t frame) {
-  if (!s_anim.pixels) return;
-  frame %= s_anim.frameCount;
-  size_t fb = s_anim.w * s_anim.h;
-  spr.draw16bitRGBBitmap(cx - s_anim.w / 2, cy - s_anim.h / 2,
-                         s_anim.pixels + frame * fb, s_anim.w, s_anim.h);
-}
-
-void usageDisplayDrawThinking(uint32_t animStartMs) {
-  loadAnim("/think.anim");
-
+void usageDisplayDrawEaster555(uint32_t elapsedMs) {
+  if (!loadImg555()) { spr.fillScreen(COL_BG); return; }
   spr.fillScreen(COL_BG);
+  uint32_t cycle = elapsedMs % 200;
+  if (cycle < 100) {
+    int cx = SAFE_L + SAFE_W / 2;
+    int cy = SAFE_T + SAFE_H / 2;
+    spr.draw16bitRGBBitmap(cx - s_img555W / 2, cy - s_img555H / 2,
+                           s_img555, s_img555W, s_img555H);
+  }
+}
 
-  uint32_t elapsed = millis() - animStartMs;
-  uint32_t frame = s_anim.delayMs ? (elapsed / s_anim.delayMs) : 0;
-
-  int cx = SAFE_L + SAFE_W / 2;
-  int cy = SAFE_T + SAFE_H / 2;
-  drawAnimFrame(cx, cy, frame);
-
+void usageDisplayDrawThinking(uint32_t elapsedMs) {
+  if (!loadImg555()) { spr.fillScreen(COL_BG); return; }
+  spr.fillScreen(COL_BG);
+  uint32_t cycle = elapsedMs % 200;
+  bool show = cycle < 100;
+  if (show) {
+    int cx = SAFE_L + SAFE_W / 2;
+    spr.draw16bitRGBBitmap(cx - s_img555W / 2, SAFE_T + 80,
+                           s_img555, s_img555W, s_img555H);
+  }
   spr.setFont(u8g2_font_wqy16_t_gb2312b);
   spr.setTextColor(COL_TEXT);
-  spr.setCursor(cx - 48, cy + s_anim.h / 2 + 30);
+  spr.setCursor(SAFE_L + 16, SAFE_T + 120);
   spr.print("思考中...");
 }

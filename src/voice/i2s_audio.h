@@ -3,6 +3,6 @@
 #include <stddef.h>
 
 bool audioInit();
-bool audioStart();
-void audioStop();
-size_t audioRead(uint8_t* buf, size_t len);
+bool audioTxStart();
+void audioTxWrite(const uint8_t* data, size_t len);
+void audioTxStop();
