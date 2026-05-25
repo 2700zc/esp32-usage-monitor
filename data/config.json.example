@@ -1,5 +1,7 @@
 {
   "server_id": "YOUR_SERVER_ID",
   "cookie": "oc_locale=zh; auth=YOUR_AUTH_COOKIE",
-  "workspace_id": "YOUR_WORKSPACE_ID"
+  "workspace_id": "YOUR_WORKSPACE_ID",
+  "pc_host": "192.168.31.100",
+  "pc_port": 12345
 }
