@@ -105,6 +105,13 @@ void usageDisplayDraw(const UsageData& data, const char* ip) {
       char buf[24];
       formatTime(buf, sizeof(buf), sec.resetSec);
       spr.print(buf);
+    }
+  }
+
+  if (ip && ip[0]) {
+    spr.setTextColor(COL_YELLOW);
+    spr.setCursor(SAFE_L, 200);
+    spr.printf("IP: %s", ip);
   }
 }
 
@@ -159,13 +166,6 @@ void usageDisplayDrawFailed(uint32_t elapsedMs) {
   spr.setTextColor(COL_DIM);
   spr.setCursor(cx - 40, SAFE_T + 155);
   spr.printf("%us 后返回...", (unsigned int)(2 - elapsedMs / 1000));
-}
-
-  if (ip && ip[0]) {
-    spr.setTextColor(COL_YELLOW);
-    spr.setCursor(SAFE_L, 200);
-    spr.printf("IP: %s", ip);
-  }
 }
 
 static const char* s_weekDays[7] = { "周日", "周一", "周二", "周三", "周四", "周五", "周六" };
