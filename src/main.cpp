@@ -23,11 +23,34 @@ static WiFiServer s_server(80);
 static bool s_thinking = false;
 static uint32_t s_thinkingSince = 0;
 
+static int s_thinkingStep = 0;
+static char s_thinkingMsg[64] = "";
+static int s_totalSteps = 0;
+static bool s_showDone = false;
+static bool s_showFailed = false;
+static uint32_t s_doneSince = 0;
+
 static int s_easterState = 0;
 static uint32_t s_easterStart = 0;
 static File s_easterFile;
 static uint32_t s_easterTotal = 0;
 static uint32_t s_easterWritten = 0;
+
+static void urlDecode(char* dst, const char* src, size_t dstSize) {
+  size_t di = 0;
+  for (size_t si = 0; src[si] && di < dstSize - 1; si++) {
+    if (src[si] == '%' && src[si+1] && src[si+2]) {
+      char hex[3] = { src[si+1], src[si+2], 0 };
+      dst[di++] = (char)strtol(hex, nullptr, 16);
+      si += 2;
+    } else if (src[si] == '+') {
+      dst[di++] = ' ';
+    } else {
+      dst[di++] = src[si];
+    }
+  }
+  dst[di] = 0;
+}
 
 extern "C" void handleHttpStatus() {
     WiFiClient client = s_server.accept();
@@ -52,10 +75,43 @@ extern "C" void handleHttpStatus() {
     if (req.indexOf("state=running") >= 0) {
         s_thinking = true;
         s_thinkingSince = millis();
-        Serial.println("state=running");
-    } else if (req.indexOf("state=done") >= 0 || req.indexOf("state=failed") >= 0) {
+        s_thinkingStep = 0;
+        s_thinkingMsg[0] = 0;
+
+        int stepIdx = req.indexOf("step=");
+        if (stepIdx >= 0) {
+            s_thinkingStep = atoi(req.c_str() + stepIdx + 5);
+        }
+
+        int msgIdx = req.indexOf("msg=");
+        if (msgIdx >= 0) {
+            const char* start = req.c_str() + msgIdx + 4;
+            char raw[64] = "";
+            int ri = 0;
+            while (*start && *start != ' ' && *start != '&' && ri < 63) {
+                raw[ri++] = *start++;
+            }
+            raw[ri] = 0;
+            urlDecode(s_thinkingMsg, raw, sizeof(s_thinkingMsg));
+        }
+
+        Serial.printf("state=running step=%d msg=%s\n", s_thinkingStep, s_thinkingMsg);
+
+    } else if (req.indexOf("state=done") >= 0) {
+        if (s_thinking) {
+            s_showDone = true;
+            s_doneSince = millis();
+        }
         s_thinking = false;
-        Serial.println("state=done/failed");
+        Serial.println("state=done");
+
+    } else if (req.indexOf("state=failed") >= 0) {
+        if (s_thinking) {
+            s_showFailed = true;
+            s_doneSince = millis();
+        }
+        s_thinking = false;
+        Serial.println("state=failed");
     }
 
     client.println("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK");
@@ -207,12 +263,15 @@ void loop() {
         }
     }
 
-    // PWR / KEY1: stop easter or dismiss thinking
+    // PWR / KEY1: dismiss overlays or toggle time
     if (hwBtnA().wasPressed) {
         if (s_easterState == 1) {
             stopEaster();
         }
-        if (s_thinking) {
+        if (s_showDone || s_showFailed) {
+            s_showDone = false;
+            s_showFailed = false;
+        } else if (s_thinking) {
             s_thinking = false;
         } else {
             s_showTime = !s_showTime;
@@ -224,8 +283,18 @@ void loop() {
     // Draw
     if (s_easterState == 1) {
         usageDisplayDrawEaster555(now - s_easterStart);
+    } else if (s_showDone) {
+        usageDisplayDrawDone(s_thinkingStep, now - s_doneSince);
+        if (now - s_doneSince >= 2000) {
+            s_showDone = false;
+        }
+    } else if (s_showFailed) {
+        usageDisplayDrawFailed(now - s_doneSince);
+        if (now - s_doneSince >= 2000) {
+            s_showFailed = false;
+        }
     } else if (s_thinking) {
-        usageDisplayDrawThinking(now - s_thinkingSince);
+        usageDisplayDrawThinking(now - s_thinkingSince, s_thinkingStep, s_thinkingMsg);
     } else {
         if (s_showTime) {
             usageDisplayDrawTime(WiFi.localIP().toString().c_str(), s_timeValid);
