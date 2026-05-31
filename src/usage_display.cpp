@@ -22,6 +22,17 @@ static uint16_t accentColor(int pct) {
   return COL_GREEN;
 }
 
+static void drawIndeterminateBar(int x, int y, int w, uint32_t elapsedMs) {
+  int barW = w * 30 / 100;
+  uint32_t cycle = elapsedMs % 1000;
+  int pos = (int)(((int64_t)cycle * (w + barW)) / 1000) - barW;
+  int drawX = pos;
+  if (drawX < 0) drawX = 0;
+  if (drawX > w - barW) drawX = w - barW;
+  spr.fillRect(x, y, w, 4, COL_DIM);
+  spr.fillRect(x + drawX, y, barW, 4, COL_GREEN);
+}
+
 static void formatTime(char* buf, size_t sz, uint32_t sec) {
   uint32_t d = sec / 86400; sec %= 86400;
   uint32_t h = sec / 3600;  sec %= 3600;
@@ -94,8 +105,61 @@ void usageDisplayDraw(const UsageData& data, const char* ip) {
       char buf[24];
       formatTime(buf, sizeof(buf), sec.resetSec);
       spr.print(buf);
-    }
   }
+}
+
+void usageDisplayDrawDone(int steps, uint32_t elapsedMs) {
+  spr.fillScreen(COL_BG);
+
+  // 大号绿色对勾
+  spr.setFont(u8g2_font_wqy16_t_gb2312b);
+  spr.setTextColor(COL_GREEN);
+  int cx = SAFE_L + SAFE_W / 2;
+  spr.setCursor(cx - 12, SAFE_T + 60);
+  spr.print("OK");
+
+  // "思考完成" 大字
+  spr.setCursor(cx - 40, SAFE_T + 100);
+  spr.print("思考完成");
+
+  // 统计信息
+  spr.setFont(u8g2_font_wqy14_t_gb2312b);
+  spr.setTextColor(COL_DIM);
+  spr.setCursor(cx - 50, SAFE_T + 135);
+  uint32_t sec = elapsedMs / 1000;
+  if (sec < 60) {
+    spr.printf("%d 步 · 用时 %us", steps, (unsigned int)sec);
+  } else if (sec < 3600) {
+    spr.printf("%d 步 · 用时 %um%us", steps, (unsigned int)(sec / 60), (unsigned int)(sec % 60));
+  } else {
+    spr.printf("%d 步 · 用时 %uh%um", steps, (unsigned int)(sec / 3600), (unsigned int)((sec % 3600) / 60));
+  }
+
+  // 倒计时提示
+  spr.setCursor(cx - 40, SAFE_T + 165);
+  spr.printf("%us 后返回...", (unsigned int)(2 - elapsedMs / 1000));
+}
+
+void usageDisplayDrawFailed(uint32_t elapsedMs) {
+  spr.fillScreen(COL_BG);
+
+  // 红色叉号
+  spr.setFont(u8g2_font_wqy16_t_gb2312b);
+  spr.setTextColor(COL_RED);
+  int cx = SAFE_L + SAFE_W / 2;
+  spr.setCursor(cx - 12, SAFE_T + 80);
+  spr.print("X");
+
+  // "任务失败" 大字
+  spr.setCursor(cx - 40, SAFE_T + 120);
+  spr.print("任务失败");
+
+  // 倒计时提示
+  spr.setFont(u8g2_font_wqy14_t_gb2312b);
+  spr.setTextColor(COL_DIM);
+  spr.setCursor(cx - 40, SAFE_T + 155);
+  spr.printf("%us 后返回...", (unsigned int)(2 - elapsedMs / 1000));
+}
 
   if (ip && ip[0]) {
     spr.setTextColor(COL_YELLOW);
@@ -187,17 +251,55 @@ void usageDisplayDrawEaster555(uint32_t elapsedMs) {
   }
 }
 
-void usageDisplayDrawThinking(uint32_t elapsedMs) {
+void usageDisplayDrawThinking(uint32_t elapsedMs, int step, const char* msg) {
   if (!loadImg555()) { spr.fillScreen(COL_BG); return; }
   spr.fillScreen(COL_BG);
-  uint32_t cycle = elapsedMs % 200;
-  if (cycle < 100) {
+
+  // 555 Logo 闪烁 (200ms 周期, 50% 占空比)
+  uint32_t logoCycle = elapsedMs % 200;
+  if (logoCycle < 100) {
     int cx = SAFE_L + SAFE_W / 2;
-    spr.draw16bitRGBBitmap(cx - s_img555W / 2, SAFE_T + 50,
+    spr.draw16bitRGBBitmap(cx - s_img555W / 2, SAFE_T + 24,
                            s_img555, s_img555W, s_img555H);
   }
+
+  // "思考中" 文字 + 省略号动画 (600ms 周期: 3/4/5个点)
   spr.setFont(u8g2_font_wqy16_t_gb2312b);
   spr.setTextColor(COL_TEXT);
-  spr.setCursor(SAFE_L + 16, SAFE_T + 148);
-  spr.print("思考中...");
+  spr.setCursor(SAFE_L + 20, SAFE_T + 90);
+  uint32_t dotCycle = (elapsedMs % 600) / 200;
+  spr.print("思考中");
+  for (uint32_t i = 0; i <= dotCycle; i++) spr.print(".");
+
+  // 不定长滚动进度条
+  drawIndeterminateBar(SAFE_L + 8, SAFE_T + 108, SAFE_W - 16, elapsedMs);
+
+  // 步骤计数
+  spr.setFont(u8g2_font_wqy14_t_gb2312b);
+  spr.setTextColor(COL_TEXT);
+  spr.setCursor(SAFE_L + 8, SAFE_T + 130);
+  spr.printf("步骤 %d", step);
+
+  // 操作描述 (如果有)
+  if (msg && msg[0]) {
+    spr.setFont(u8g2_font_wqy12_t_gb2312b);
+    spr.setTextColor(COL_DIM);
+    spr.setCursor(SAFE_L + 8, SAFE_T + 150);
+    char truncated[32];
+    snprintf(truncated, sizeof(truncated), "%.28s", msg);
+    spr.print(truncated);
+  }
+
+  // 实时计时
+  spr.setFont(u8g2_font_wqy14_t_gb2312b);
+  spr.setTextColor(COL_DIM);
+  spr.setCursor(SAFE_L + 8, SAFE_T + 172);
+  uint32_t sec = elapsedMs / 1000;
+  if (sec < 60) {
+    spr.printf("已用: %us", (unsigned int)sec);
+  } else if (sec < 3600) {
+    spr.printf("已用: %um%us", (unsigned int)(sec / 60), (unsigned int)(sec % 60));
+  } else {
+    spr.printf("已用: %uh%um", (unsigned int)(sec / 3600), (unsigned int)((sec % 3600) / 60));
+  }
 }
