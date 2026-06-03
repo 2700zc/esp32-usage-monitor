@@ -6,7 +6,7 @@
 #include "hw/hw.h"
 #include "hw/net.h"
 #include "voice/i2s_audio.h"
-#include "voice/stt.h"
+#include "voice/audio_recorder.h"
 #include "hw/imu.h"
 #include "wifi_config.h"
 #include <ESPmDNS.h>
@@ -49,7 +49,7 @@ static char s_ssid[33] = "";
 static WfConfig s_wfCfg;
 static bool s_inWifiConfig = false;
 
-static SttContext s_stt;
+static RecorderContext s_recorder;
 
 static void urlDecode(char* dst, const char* src, size_t dstSize) {
   size_t di = 0;
@@ -162,7 +162,7 @@ void setup() {
 
     loadConfig(s_cfg);
     audioInit();
-    sttInit(s_stt);
+    recorderInit(s_recorder);
 
     char savedSSID[33], savedPass[65];
     bool hasCreds = netLoadCred(savedSSID, 33, savedPass, 65);
@@ -278,26 +278,27 @@ void loop() {
         wfInit(s_wfCfg);
     }
 
-    // ── STT state machine ──────────────────────────────────
+    // ── Recorder state machine ──────────────────────────────────
     if (s_wifiConnected && s_cfg.pc_host[0] != '\0' && s_cfg.pc_port != 0) {
-        if (hwBtnB().wasPressed && s_stt.state == SttState::Idle && s_easterState == 0 && !s_thinking) {
-            sttStartRecording(s_stt);
-        } else if (hwBtnB().wasPressed && s_stt.state == SttState::Recording) {
-            sttStopRecording(s_stt, s_cfg.pc_host, s_cfg.pc_port);
+        if (hwBtnB().wasPressed && s_recorder.state == RecorderState::Idle && s_easterState == 0 && !s_thinking) {
+            recorderStart(s_recorder, s_cfg.pc_host, s_cfg.pc_port);
+        } else if (hwBtnB().wasPressed && s_recorder.state == RecorderState::Recording) {
+            recorderStop(s_recorder, s_cfg.pc_host, s_cfg.pc_port);
         }
     }
 
-    if (s_stt.state == SttState::Recording) {
-        sttTick(s_stt);
-        uint32_t elapsed = millis() - s_stt.stateSince;
-        if (elapsed >= SttContext::MAX_RECORD_MS) {
-            sttStopRecording(s_stt, s_cfg.pc_host, s_cfg.pc_port);
+    recorderTick(s_recorder);
+
+    if (s_recorder.state == RecorderState::Recording) {
+        uint32_t elapsed = millis() - s_recorder.stateSince;
+        if (elapsed >= 30000) {
+            recorderStop(s_recorder, s_cfg.pc_host, s_cfg.pc_port);
         }
     }
 
-    if ((s_stt.state == SttState::Success || s_stt.state == SttState::Failed) &&
-        millis() - s_stt.stateSince >= 3000) {
-        sttReset(s_stt);
+    if ((s_recorder.state == RecorderState::Done || s_recorder.state == RecorderState::Failed) &&
+        millis() - s_recorder.stateSince >= 3000) {
+        recorderReset(s_recorder);
     }
 
     // Draw
@@ -328,15 +329,15 @@ void loop() {
         }
     } else if (s_thinking) {
         usageDisplayDrawThinking(now - s_thinkingSince, s_thinkingStep, s_thinkingMsg);
-    } else if (s_stt.state == SttState::Recording) {
-        uint32_t elapsed = millis() - s_stt.stateSince;
+    } else if (s_recorder.state == RecorderState::Recording) {
+        uint32_t elapsed = millis() - s_recorder.stateSince;
         usageDisplayDrawRecorderRecording(elapsed);
-    } else if (s_stt.state == SttState::Uploading) {
+    } else if (s_recorder.state == RecorderState::Uploading) {
         usageDisplayDrawRecorderUploading();
-    } else if (s_stt.state == SttState::Success) {
-        usageDisplayDrawRecorderDone(s_stt.resultText, millis() - s_stt.stateSince);
-    } else if (s_stt.state == SttState::Failed) {
-        usageDisplayDrawRecorderFailed(millis() - s_stt.stateSince);
+    } else if (s_recorder.state == RecorderState::Done) {
+        usageDisplayDrawRecorderDone(s_recorder.savePath, millis() - s_recorder.stateSince);
+    } else if (s_recorder.state == RecorderState::Failed) {
+        usageDisplayDrawRecorderFailed(millis() - s_recorder.stateSince);
     } else if (s_wifiConnected) {
         if (s_showTime) {
             usageDisplayDrawTime(WiFi.localIP().toString().c_str(), s_timeValid);
