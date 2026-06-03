@@ -330,13 +330,13 @@ void loop() {
         usageDisplayDrawThinking(now - s_thinkingSince, s_thinkingStep, s_thinkingMsg);
     } else if (s_stt.state == SttState::Recording) {
         uint32_t elapsed = millis() - s_stt.stateSince;
-        usageDisplayDrawSttRecording(elapsed);
+        usageDisplayDrawRecorderRecording(elapsed);
     } else if (s_stt.state == SttState::Uploading) {
-        usageDisplayDrawSttUploading();
+        usageDisplayDrawRecorderUploading();
     } else if (s_stt.state == SttState::Success) {
-        usageDisplayDrawSttResult(s_stt.resultText, millis() - s_stt.stateSince);
+        usageDisplayDrawRecorderDone(s_stt.resultText, millis() - s_stt.stateSince);
     } else if (s_stt.state == SttState::Failed) {
-        usageDisplayDrawSttFailed(millis() - s_stt.stateSince);
+        usageDisplayDrawRecorderFailed(millis() - s_stt.stateSince);
     } else if (s_wifiConnected) {
         if (s_showTime) {
             usageDisplayDrawTime(WiFi.localIP().toString().c_str(), s_timeValid);
