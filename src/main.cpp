@@ -291,8 +291,16 @@ void loop() {
 
     if (s_recorder.state == RecorderState::Recording) {
         uint32_t elapsed = millis() - s_recorder.stateSince;
-        if (elapsed >= 30000) {
+        if (elapsed >= MAX_RECORD_MS) {
             recorderStop(s_recorder, s_cfg.pc_host, s_cfg.pc_port);
+        }
+    }
+
+    if (s_recorder.state == RecorderState::Uploading) {
+        uint32_t elapsed = millis() - s_recorder.stateSince;
+        if (elapsed >= 5000) {
+            Serial.println("recorder: no response from PC");
+            recorderReset(s_recorder);
         }
     }
 
@@ -342,8 +350,14 @@ void loop() {
         if (s_showTime) {
             usageDisplayDrawTime(WiFi.localIP().toString().c_str(), s_timeValid);
         } else {
-            usageDisplayDraw(s_usage, WiFi.localIP().toString().c_str());
+        usageDisplayDraw(s_usage, WiFi.localIP().toString().c_str());
+        if (s_recorder.state == RecorderState::Idle && s_cfg.pc_host[0] != '\0') {
+            spr.setFont(u8g2_font_wqy12_t_gb2312b);
+            spr.setTextColor(MAIN_DIM);
+            spr.setCursor(SAFE_L, SAFE_T + SAFE_H - 20);
+            spr.print("按 KEY2 录音");
         }
+    }
     }
 
     hwDisplayPush();

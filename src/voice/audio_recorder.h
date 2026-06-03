@@ -15,6 +15,8 @@ struct RecorderContext {
     char savePath[64] = "";
 };
 
+static const uint32_t MAX_RECORD_MS = 30000;
+
 void recorderInit(RecorderContext& ctx);
 bool recorderStart(RecorderContext& ctx, const char* pcHost, uint16_t pcPort);
 void recorderTick(RecorderContext& ctx);

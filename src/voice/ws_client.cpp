@@ -99,16 +99,17 @@ bool wsIsConnected() {
 
 void wsDisconnect() {
     s_running = false;
+    if (s_ws) {
+        esp_transport_close(s_ws);
+    }
     if (s_readTask) {
         vTaskDelete(s_readTask);
         s_readTask = nullptr;
     }
     if (s_ws) {
-        esp_transport_close(s_ws);
         esp_transport_destroy(s_ws);
         s_ws = nullptr;
     }
-    s_cb = nullptr;
 }
 
 void wsSetCallback(WsCallback cb) {

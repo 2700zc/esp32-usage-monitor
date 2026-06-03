@@ -5,7 +5,6 @@
 #include <cstring>
 #include <cstdio>
 
-static const uint32_t MAX_RECORD_MS = 30000;
 static const size_t PCM_CHUNK = 640;
 
 static RecorderContext* s_ctx = nullptr;
@@ -44,6 +43,8 @@ void recorderInit(RecorderContext& ctx) {
 
 bool recorderStart(RecorderContext& ctx, const char* pcHost, uint16_t pcPort) {
     if (ctx.state != RecorderState::Idle) return false;
+
+    wsSetCallback(onWsMessage);
 
     if (!wsConnect(pcHost, pcPort)) {
         Serial.println("recorder: ws connect failed");
@@ -94,20 +95,7 @@ void recorderStop(RecorderContext& ctx, const char* pcHost, uint16_t pcPort) {
     ctx.stateSince = millis();
 
     wsSendText("{\"type\":\"stop\"}");
-
-    uint32_t t0 = millis();
-    while (millis() - t0 < 5000) {
-        if (ctx.state == RecorderState::Done ||
-            ctx.state == RecorderState::Failed) break;
-        delay(10);
-    }
-
-    if (ctx.state == RecorderState::Uploading) {
-        ctx.state = RecorderState::Failed;
-        Serial.println("recorder: no response from PC");
-    }
-
-    wsDisconnect();
+    Serial.println("recorder: stop sent, waiting for PC response");
 }
 
 void recorderReset(RecorderContext& ctx) {
