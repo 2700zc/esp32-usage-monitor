@@ -25,7 +25,7 @@ static volatile bool                          s_tpIrqFlag = false;
 
 static void IRAM_ATTR onTouchIrq() { s_tpIrqFlag = true; }
 
-bool HwBtn::pressedFor(uint32_t ms) {
+bool HwBtn::pressedFor(uint32_t ms) const {
   return isPressed && (millis() - pressedAt) >= ms;
 }
 

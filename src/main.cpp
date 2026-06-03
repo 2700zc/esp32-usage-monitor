@@ -6,11 +6,19 @@
 #include "hw/hw.h"
 #include "hw/net.h"
 #include "voice/i2s_audio.h"
+#include "voice/stt.h"
 #include "hw/imu.h"
+#include "wifi_config.h"
+#include <ESPmDNS.h>
 #include <math.h>
 #include <WiFi.h>
 #include <time.h>
 #include <LittleFS.h>
+#include <U8g2lib.h>
+
+static const uint16_t MAIN_BG     = 0x0000;
+static const uint16_t MAIN_YELLOW = 0xFFE0;
+static const uint16_t MAIN_DIM    = 0x4208;
 
 static UsageData s_usage;
 static AppConfig s_cfg;
@@ -36,6 +44,13 @@ static File s_easterFile;
 static uint32_t s_easterTotal = 0;
 static uint32_t s_easterWritten = 0;
 
+static bool s_wifiConnected = false;
+static char s_ssid[33] = "";
+static WfConfig s_wfCfg;
+static bool s_inWifiConfig = false;
+
+static SttContext s_stt;
+
 static void urlDecode(char* dst, const char* src, size_t dstSize) {
   size_t di = 0;
   for (size_t si = 0; src[si] && di < dstSize - 1; si++) {
@@ -53,6 +68,7 @@ static void urlDecode(char* dst, const char* src, size_t dstSize) {
 }
 
 extern "C" void handleHttpStatus() {
+    if (!s_wifiConnected) return;
     WiFiClient client = s_server.accept();
     if (!client) return;
 
@@ -95,15 +111,12 @@ extern "C" void handleHttpStatus() {
             urlDecode(s_thinkingMsg, raw, sizeof(s_thinkingMsg));
         }
 
-        Serial.printf("state=running step=%d msg=%s\n", s_thinkingStep, s_thinkingMsg);
-
     } else if (req.indexOf("state=done") >= 0) {
         if (s_thinking) {
             s_showDone = true;
             s_doneSince = millis();
         }
         s_thinking = false;
-        Serial.println("state=done");
 
     } else if (req.indexOf("state=failed") >= 0) {
         if (s_thinking) {
@@ -111,7 +124,6 @@ extern "C" void handleHttpStatus() {
             s_doneSince = millis();
         }
         s_thinking = false;
-        Serial.println("state=failed");
     }
 
     client.println("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nOK");
@@ -139,55 +151,28 @@ static void syncNtp() {
 }
 
 void setup() {
-    Serial.begin(115200);
-    delay(100);
-    Serial.println("ESP32 Usage Monitor");
-
     hwInit();
-    loadConfig(s_cfg);
-    bool audioOk = audioInit();
 
-    if (audioOk) {
-        // Boot test tone: 440 Hz sine, 1 second
-        uint8_t toneBuf[512];
-        float phase = 0;
-        uint32_t total = 0;
-        const uint32_t target = 32000;
-        if (audioTxStart()) {
-            while (total < target) {
-                size_t n = 512;
-                if (total + n > target) n = target - total;
-                for (size_t i = 0; i < n; i += 2) {
-                    int16_t s = (int16_t)(8000 * sin(phase));
-                    toneBuf[i] = s & 0xFF;
-                    toneBuf[i + 1] = (s >> 8) & 0xFF;
-                    phase += 2 * PI * 440.0 / 16000.0;
-                    if (phase > 2 * PI) phase -= 2 * PI;
-                }
-                audioTxWrite(toneBuf, n);
-                total += n;
-            }
-            audioTxStop();
-            Serial.println("boot tone done");
-        }
-    }
+    spr.fillScreen(MAIN_BG);
+    spr.setFont(u8g2_font_wqy16_t_gb2312b);
+    spr.setTextColor(MAIN_YELLOW);
+    spr.setCursor(SAFE_L, SAFE_T + 60);
+    spr.print("Booting...");
+    hwDisplayPush();
+
+    loadConfig(s_cfg);
+    audioInit();
+    sttInit(s_stt);
 
     char savedSSID[33], savedPass[65];
     bool hasCreds = netLoadCred(savedSSID, 33, savedPass, 65);
-
     if (hasCreds) {
+        strlcpy(s_ssid, savedSSID, sizeof(s_ssid));
         WiFi.mode(WIFI_STA);
         WiFi.begin(savedSSID, savedPass);
-    }
-
-    for (;;) {
-        if (WiFi.status() == WL_CONNECTED) {
-            syncNtp();
-            s_server.begin();
-            Serial.println("WiFi connected");
-            break;
-        }
-        delay(500);
+    } else {
+        s_inWifiConfig = true;
+        wfInit(s_wfCfg);
     }
 }
 
@@ -203,9 +188,21 @@ void loop() {
     hwInputUpdate();
     handleHttpStatus();
 
+    if (!s_wifiConnected) {
+        if (WiFi.status() == WL_CONNECTED) {
+            s_wifiConnected = true;
+            syncNtp();
+            s_server.begin();
+            MDNS.begin("esp32-monitor");
+        }
+    } else if (WiFi.status() != WL_CONNECTED) {
+        s_wifiConnected = false;
+        WiFi.reconnect();
+    }
+
     uint32_t now = millis();
 
-    if (now - s_lastFetch >= 60000 || s_lastFetch == 0) {
+    if (s_wifiConnected && (now - s_lastFetch >= 60000 || s_lastFetch == 0)) {
         s_lastFetch = now;
         apiFetchUsage(s_usage, s_cfg.server_id, s_cfg.cookie, s_cfg.workspace_id);
     }
@@ -216,7 +213,6 @@ void loop() {
         syncNtp();
     }
 
-    // Shake detection
     if (s_easterState == 0 && !s_thinking) {
         float ax, ay, az;
         hwImuAccel(&ax, &ay, &az);
@@ -229,7 +225,6 @@ void loop() {
         }
         if (shakeCount >= 3) {
             shakeCount = 0;
-            Serial.println("Easter: shake detected!");
             stopEaster();
             s_thinking = false;
             s_easterFile = LittleFS.open("/555_audio.raw", "r");
@@ -239,12 +234,10 @@ void loop() {
                 s_easterStart = now;
                 s_easterState = 1;
                 audioTxStart();
-                Serial.printf("Easter: playing %u bytes\n", s_easterTotal);
             }
         }
     }
 
-    // Easter egg audio streaming
     if (s_easterState == 1) {
         uint8_t buf[512];
         size_t toRead = sizeof(buf);
@@ -259,29 +252,69 @@ void loop() {
             s_easterFile.close();
             audioTxStop();
             s_easterState = 0;
-            Serial.println("Easter: done");
         }
     }
 
-    // PWR / KEY1: dismiss overlays or toggle time
     if (hwBtnA().wasPressed) {
         if (s_easterState == 1) {
             stopEaster();
-        }
-        if (s_showDone || s_showFailed) {
-            s_showDone = false;
-            s_showFailed = false;
-        } else if (s_thinking) {
-            s_thinking = false;
-        } else {
-            s_showTime = !s_showTime;
+        } else if (!s_inWifiConfig) {
+            if (s_showDone || s_showFailed) {
+                s_showDone = false;
+                s_showFailed = false;
+            } else if (s_thinking) {
+                s_thinking = false;
+            } else if (!s_wifiConnected) {
+                s_inWifiConfig = true;
+                wfInit(s_wfCfg);
+            } else {
+                s_showTime = !s_showTime;
+            }
         }
     }
 
-    // Thinking auto-dismiss: removed per user request — only state=done clears it
+    if (hwBtnBoot().wasPressed && !s_inWifiConfig && s_wifiConnected) {
+        s_inWifiConfig = true;
+        wfInit(s_wfCfg);
+    }
+
+    // ── STT state machine ──────────────────────────────────
+    if (s_wifiConnected && s_cfg.pc_host[0] != '\0' && s_cfg.pc_port != 0) {
+        if (hwBtnB().wasPressed && s_stt.state == SttState::Idle && s_easterState == 0 && !s_thinking) {
+            sttStartRecording(s_stt);
+        } else if (hwBtnB().wasPressed && s_stt.state == SttState::Recording) {
+            sttStopRecording(s_stt, s_cfg.pc_host, s_cfg.pc_port);
+        }
+    }
+
+    if (s_stt.state == SttState::Recording) {
+        sttTick(s_stt);
+        uint32_t elapsed = millis() - s_stt.stateSince;
+        if (elapsed >= SttContext::MAX_RECORD_MS) {
+            sttStopRecording(s_stt, s_cfg.pc_host, s_cfg.pc_port);
+        }
+    }
+
+    if ((s_stt.state == SttState::Success || s_stt.state == SttState::Failed) &&
+        millis() - s_stt.stateSince >= 3000) {
+        sttReset(s_stt);
+    }
 
     // Draw
-    if (s_easterState == 1) {
+    if (s_inWifiConfig) {
+        bool done = wfTick(s_wfCfg);
+        if (s_wfCfg.state == WfState::Connected) {
+            s_wifiConnected = true;
+            strlcpy(s_ssid, s_wfCfg.ssid, sizeof(s_ssid));
+            syncNtp();
+            s_server.begin();
+            MDNS.begin("esp32-monitor");
+            s_inWifiConfig = false;
+        } else if (done) {
+            s_inWifiConfig = false;
+        }
+        wfDraw(s_wfCfg);
+    } else if (s_easterState == 1) {
         usageDisplayDrawEaster555(now - s_easterStart);
     } else if (s_showDone) {
         usageDisplayDrawDone(s_thinkingStep, now - s_doneSince);
@@ -295,7 +328,16 @@ void loop() {
         }
     } else if (s_thinking) {
         usageDisplayDrawThinking(now - s_thinkingSince, s_thinkingStep, s_thinkingMsg);
-    } else {
+    } else if (s_stt.state == SttState::Recording) {
+        uint32_t elapsed = millis() - s_stt.stateSince;
+        usageDisplayDrawSttRecording(elapsed);
+    } else if (s_stt.state == SttState::Uploading) {
+        usageDisplayDrawSttUploading();
+    } else if (s_stt.state == SttState::Success) {
+        usageDisplayDrawSttResult(s_stt.resultText, millis() - s_stt.stateSince);
+    } else if (s_stt.state == SttState::Failed) {
+        usageDisplayDrawSttFailed(millis() - s_stt.stateSince);
+    } else if (s_wifiConnected) {
         if (s_showTime) {
             usageDisplayDrawTime(WiFi.localIP().toString().c_str(), s_timeValid);
         } else {

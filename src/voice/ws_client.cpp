@@ -85,7 +85,7 @@ bool wsConnect(const char* host, uint16_t port) {
 
 void wsSendBin(const uint8_t* data, size_t len) {
     if (!s_ws) return;
-    esp_transport_write(s_ws, (const char*)data, (int)len, portMAX_DELAY);
+    esp_transport_ws_send_raw(s_ws, WS_TRANSPORT_OPCODES_BINARY, (const char*)data, (int)len, portMAX_DELAY);
 }
 
 void wsSendText(const char* json) {

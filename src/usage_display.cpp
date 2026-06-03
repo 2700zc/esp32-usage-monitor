@@ -303,3 +303,108 @@ void usageDisplayDrawThinking(uint32_t elapsedMs, int step, const char* msg) {
     spr.printf("已用: %uh%um", (unsigned int)(sec / 3600), (unsigned int)((sec % 3600) / 60));
   }
 }
+
+void usageDisplayDrawSttRecording(uint32_t elapsedMs) {
+  spr.fillScreen(COL_BG);
+
+  spr.setFont(u8g2_font_wqy16_t_gb2312b);
+  spr.setTextColor(COL_RED);
+  int cx = SAFE_L + SAFE_W / 2;
+  spr.setCursor(cx - 36, SAFE_T + 50);
+  spr.print("录音中");
+
+  uint32_t dotCycle = (elapsedMs % 600) / 200;
+  for (uint32_t i = 0; i <= dotCycle; i++) spr.print(".");
+
+  spr.setFont(u8g2_font_wqy14_t_gb2312b);
+  spr.setTextColor(COL_DIM);
+  spr.setCursor(cx - 30, SAFE_T + 85);
+  uint32_t sec = elapsedMs / 1000;
+  spr.printf("%lus / 10s", (unsigned long)sec);
+
+  drawIndeterminateBar(SAFE_L + 8, SAFE_T + 105, SAFE_W - 16, elapsedMs);
+
+  spr.setFont(u8g2_font_wqy12_t_gb2312b);
+  spr.setTextColor(COL_DIM);
+  spr.setCursor(SAFE_L + 8, SAFE_T + 140);
+  spr.print("按 KEY2 停止录音");
+}
+
+void usageDisplayDrawSttUploading() {
+  spr.fillScreen(COL_BG);
+
+  spr.setFont(u8g2_font_wqy16_t_gb2312b);
+  spr.setTextColor(COL_YELLOW);
+  int cx = SAFE_L + SAFE_W / 2;
+  spr.setCursor(cx - 50, SAFE_T + 80);
+  spr.print("上传识别中...");
+
+  drawIndeterminateBar(SAFE_L + 8, SAFE_T + 105, SAFE_W - 16, millis());
+}
+
+void usageDisplayDrawSttResult(const char* text, uint32_t elapsedMs) {
+  spr.fillScreen(COL_BG);
+
+  spr.setFont(u8g2_font_wqy16_t_gb2312b);
+  spr.setTextColor(COL_GREEN);
+  int cx = SAFE_L + SAFE_W / 2;
+  spr.setCursor(cx - 36, SAFE_T + 30);
+  spr.print("识别结果");
+
+  spr.setFont(u8g2_font_wqy14_t_gb2312b);
+  spr.setTextColor(COL_TEXT);
+
+  int y = SAFE_T + 60;
+  size_t len = strlen(text);
+  const int charsPerLine = 10;
+  int lineCount = 0;
+  for (size_t i = 0; i < len && lineCount < 8; ) {
+    int lineLen = 0;
+    int bytePos = 0;
+    while (i + bytePos < len && lineLen < charsPerLine) {
+      unsigned char c = text[i + bytePos];
+      if (c < 0x80) {
+        bytePos += 1;
+        lineLen += 1;
+      } else if ((c & 0xE0) == 0xC0) {
+        bytePos += 2;
+        lineLen += 2;
+      } else if ((c & 0xF0) == 0xE0) {
+        bytePos += 3;
+        lineLen += 2;
+      } else {
+        bytePos += 4;
+        lineLen += 2;
+      }
+    }
+    char lineBuf[32] = {0};
+    int copyLen = bytePos < 31 ? bytePos : 31;
+    memcpy(lineBuf, text + i, copyLen);
+    lineBuf[copyLen] = '\0';
+    spr.setCursor(SAFE_L + 4, y);
+    spr.print(lineBuf);
+    i += bytePos;
+    y += 20;
+    lineCount++;
+  }
+
+  spr.setFont(u8g2_font_wqy12_t_gb2312b);
+  spr.setTextColor(COL_DIM);
+  spr.setCursor(SAFE_L + 8, SAFE_T + SAFE_H - 20);
+  spr.printf("%us 后返回...", (unsigned int)(3 - elapsedMs / 1000));
+}
+
+void usageDisplayDrawSttFailed(uint32_t elapsedMs) {
+  spr.fillScreen(COL_BG);
+
+  spr.setFont(u8g2_font_wqy16_t_gb2312b);
+  spr.setTextColor(COL_RED);
+  int cx = SAFE_L + SAFE_W / 2;
+  spr.setCursor(cx - 36, SAFE_T + 80);
+  spr.print("识别失败");
+
+  spr.setFont(u8g2_font_wqy14_t_gb2312b);
+  spr.setTextColor(COL_DIM);
+  spr.setCursor(cx - 40, SAFE_T + 115);
+  spr.printf("%us 后返回...", (unsigned int)(3 - elapsedMs / 1000));
+}

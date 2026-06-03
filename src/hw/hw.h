@@ -8,4 +8,5 @@
 #include "hw/expander.h"
 #include "hw/pins.h"
 
-void hwInit();   // initialises every subsystem; while(1) on any failure
+void hwInit();      // initialises every subsystem; logs errors instead of dying
+bool hwInitOk();   // returns true if all subsystems initialised OK

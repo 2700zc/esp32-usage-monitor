@@ -6,6 +6,7 @@
 #include <Wire.h>
 
 static i2s_chan_handle_t s_txHandle = nullptr;
+static i2s_chan_handle_t s_rxHandle = nullptr;
 static bool s_txEnabled = false;
 static bool s_paOn = false;
 
@@ -68,6 +69,27 @@ static void initEs8311() {
     es8311WriteReg(0x0A, 0x00);
     es8311WriteReg(0x01, 0x00);
     Serial.println("i2s_audio: ES8311 configured for DAC");
+}
+
+static void es8311EnableAdc() {
+    es8311WriteReg(0x01, 0x3F);
+    // ADC clock from MCLK,divide=1
+    es8311WriteReg(0x02, 0x00);
+    // ADC fs=16k,hpf
+    es8311WriteReg(0x09, 0x0C);
+    // ADC volume
+    es8311WriteReg(0x0D, 0x01);
+    es8311WriteReg(0x14, 0x00);
+    // ADC ramp up
+    es8311WriteReg(0x14, 0x14);
+    es8311WriteReg(0x14, 0x1C);
+    // MIC gain: +24dB
+    es8311WriteReg(0x17, 0x28);
+    // unmute ADC
+    es8311WriteReg(0x0A, 0x00);
+    // power up ADC+DAC
+    es8311WriteReg(0x01, 0x00);
+    Serial.println("i2s_audio: ES8311 ADC enabled");
 }
 
 bool audioInit() {
@@ -139,4 +161,70 @@ void audioTxStop() {
     s_paOn = false;
     digitalWrite(PIN_PA_CTRL, LOW);
     Serial.println("i2s_audio: PA off");
+}
+
+bool audioRxStart() {
+    if (s_rxHandle) {
+        i2s_channel_enable(s_rxHandle);
+        Serial.println("i2s_audio: RX re-enabled");
+        return true;
+    }
+
+    i2s_chan_config_t chanCfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    chanCfg.auto_clear = true;
+
+    esp_err_t err = i2s_new_channel(&chanCfg, nullptr, &s_rxHandle);
+    if (err != ESP_OK || !s_rxHandle) {
+        Serial.printf("i2s_audio: RX channel create failed: %s\n", esp_err_to_name(err));
+        return false;
+    }
+
+    i2s_std_config_t stdCfg = {};
+    stdCfg.clk_cfg.sample_rate_hz = 16000;
+    stdCfg.clk_cfg.clk_src = I2S_CLK_SRC_DEFAULT;
+    stdCfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+    stdCfg.clk_cfg.ext_clk_freq_hz = 0;
+
+    stdCfg.slot_cfg = I2S_STD_PHILIP_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
+    stdCfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+
+    stdCfg.gpio_cfg.mclk = (gpio_num_t)PIN_I2S_MCLK;
+    stdCfg.gpio_cfg.bclk = (gpio_num_t)PIN_I2S_BCLK;
+    stdCfg.gpio_cfg.ws   = (gpio_num_t)PIN_I2S_WS;
+    stdCfg.gpio_cfg.dout = (gpio_num_t)I2S_GPIO_UNUSED;
+    stdCfg.gpio_cfg.din  = (gpio_num_t)PIN_I2S_DI;
+
+    err = i2s_channel_init_std_mode(s_rxHandle, &stdCfg);
+    if (err != ESP_OK) {
+        Serial.printf("i2s_audio: RX std mode init failed: %s\n", esp_err_to_name(err));
+        i2s_del_channel(s_rxHandle);
+        s_rxHandle = nullptr;
+        return false;
+    }
+
+    err = i2s_channel_enable(s_rxHandle);
+    if (err != ESP_OK) {
+        Serial.printf("i2s_audio: RX enable failed: %s\n", esp_err_to_name(err));
+        i2s_del_channel(s_rxHandle);
+        s_rxHandle = nullptr;
+        return false;
+    }
+
+    es8311EnableAdc();
+    Serial.println("i2s_audio: RX started");
+    return true;
+}
+
+size_t audioRxRead(uint8_t* buf, size_t maxLen) {
+    if (!s_rxHandle) return 0;
+    size_t readBytes = 0;
+    esp_err_t err = i2s_channel_read(s_rxHandle, buf, maxLen, &readBytes, 100);
+    if (err != ESP_OK) return 0;
+    return readBytes;
+}
+
+void audioRxStop() {
+    if (!s_rxHandle) return;
+    i2s_channel_disable(s_rxHandle);
+    Serial.println("i2s_audio: RX stopped");
 }

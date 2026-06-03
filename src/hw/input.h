@@ -6,7 +6,7 @@ struct HwBtn {
   bool wasPressed;
   bool wasReleased;
   uint32_t pressedAt;
-  bool pressedFor(uint32_t ms);
+  bool pressedFor(uint32_t ms) const;
 };
 
 struct HwTouch {
