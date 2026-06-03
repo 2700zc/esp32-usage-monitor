@@ -2,12 +2,14 @@
 import asyncio
 import json
 import os
-import sys
 import argparse
 from datetime import datetime
 import struct
+from functools import partial
 
 import websockets
+
+MAX_PCM_BYTES = 960000  # 30s at 16kHz/16bit/mono
 
 def make_wav_header(pcm_len, sample_rate=16000, bits_per_sample=16, channels=1):
     byte_rate = sample_rate * channels * bits_per_sample // 8
@@ -30,9 +32,8 @@ def make_wav_header(pcm_len, sample_rate=16000, bits_per_sample=16, channels=1):
     header += struct.pack('<I', data_size)
     return header
 
-async def handler(websocket):
+async def handler(websocket, args):
     pcm_buf = bytearray()
-    save_path = None
     try:
         async for msg in websocket:
             if isinstance(msg, str):
@@ -41,14 +42,19 @@ async def handler(websocket):
                 except json.JSONDecodeError:
                     await websocket.send(json.dumps({"type":"error","msg":"invalid json"}))
                     continue
+                if not isinstance(data, dict):
+                    await websocket.send(json.dumps({"type":"error","msg":"expected json object"}))
+                    continue
                 if data["type"] == "start":
                     pcm_buf = bytearray()
                     print("recording started")
                 elif data["type"] == "stop":
+                    if len(pcm_buf) == 0:
+                        await websocket.send(json.dumps({"type":"error","msg":"no audio data received"}))
+                        continue
                     now = datetime.now()
                     filename = f"rec_{now.strftime('%Y%m%d_%H%M%S')}.wav"
                     save_path = os.path.join(args.dir, filename)
-                    os.makedirs(args.dir, exist_ok=True)
                     wav = bytearray(make_wav_header(len(pcm_buf)))
                     wav.extend(pcm_buf)
                     with open(save_path, "wb") as f:
@@ -58,6 +64,9 @@ async def handler(websocket):
                 else:
                     await websocket.send(json.dumps({"type":"error","msg":"unknown message type"}))
             elif isinstance(msg, bytes):
+                if len(pcm_buf) + len(msg) > MAX_PCM_BYTES:
+                    print("warning: pcm buffer full, discarding data")
+                    continue
                 pcm_buf.extend(msg)
     except websockets.exceptions.ConnectionClosed:
         pass
@@ -68,15 +77,16 @@ async def handler(websocket):
             pass
 
 async def main():
-    global args
     parser = argparse.ArgumentParser(description="ESP32 Recorder Server")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=12345)
     parser.add_argument("--dir", default="./recordings")
     args = parser.parse_args()
 
+    os.makedirs(args.dir, exist_ok=True)
+
     print(f"recorder server listening on {args.host}:{args.port}")
-    async with websockets.serve(handler, args.host, args.port):
+    async with websockets.serve(partial(handler, args=args), args.host, args.port):
         await asyncio.Future()
 
 if __name__ == "__main__":
