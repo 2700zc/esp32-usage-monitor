@@ -36,7 +36,11 @@ async def handler(websocket):
     try:
         async for msg in websocket:
             if isinstance(msg, str):
-                data = json.loads(msg)
+                try:
+                    data = json.loads(msg)
+                except json.JSONDecodeError:
+                    await websocket.send(json.dumps({"type":"error","msg":"invalid json"}))
+                    continue
                 if data["type"] == "start":
                     pcm_buf = bytearray()
                     print("recording started")
@@ -51,10 +55,17 @@ async def handler(websocket):
                         f.write(wav)
                     print(f"saved {save_path} ({len(pcm_buf)} bytes PCM)")
                     await websocket.send(json.dumps({"type": "saved", "path": filename}))
+                else:
+                    await websocket.send(json.dumps({"type":"error","msg":"unknown message type"}))
             elif isinstance(msg, bytes):
                 pcm_buf.extend(msg)
     except websockets.exceptions.ConnectionClosed:
         pass
+    except Exception as e:
+        try:
+            await websocket.send(json.dumps({"type":"error","msg":str(e)}))
+        except Exception:
+            pass
 
 async def main():
     global args
