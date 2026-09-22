@@ -1,20 +1,14 @@
-# ESP32-S3 用量监视器
+# ESP32-S3 DeepSeek 用量监视器
 
-在 Waveshare ESP32-S3-Touch-AMOLED-2.16 开发板上显示 OpenCode Token 用量的固件。
-
-<img width="307" height="409" alt="1b2b0536bc8ad161e428c0deda3aafb6" src="https://github.com/user-attachments/assets/d59a0a6f-1483-4df2-9ebe-b20832e409ec" />
-<img width="307" height="409" alt="b598914ee3e2701626b0c7eb8ab07a65" src="https://github.com/user-attachments/assets/d649e905-e27e-4900-8f70-dff1deca24a8" />
-
-
-
+在 Waveshare ESP32-S3-Touch-AMOLED-2.16 开发板上显示 DeepSeek 平台用量的桌面小仪表盘。
 
 ## 功能
 
-- 显示 **5小时** / **每周** / **每月** 用量进度条
-- 显示距离重置的倒计时（天时分秒格式）
-- 超过 10% 进度条变黄，超过 50% 变红
-- 每 60 秒自动刷新，按最左边按键可手动刷新
-- WiFi 配置界面（按钮输入密码）
+- 显示**今日请求数**、**今日 Tokens**（完整千分位数字）、**账户余额**（大字号，低于 5 元变红警示）
+- 每 30 秒自动刷新，按 **PWR（中键）** 可手动立即刷新
+- 深色 AMOLED 界面：纯黑背景 + 深灰圆角卡片 + 蓝/青品牌色
+- WiFi 屏幕配置界面（扫描网络 + 软键盘输密码），首次配置后开机自动连接
+- 自动连接超过 10 秒失败会回到 WiFi 配置界面重新选择
 - 配置存储在 LittleFS 文件系统
 
 ## 硬件
@@ -45,23 +39,18 @@ cp data/config.json.example data/config.json
 
 ```json
 {
-  "server_id": "你的 OpenCode server_id",
-  "cookie": "oc_locale=zh; auth=你的认证 cookie",
-  "workspace_id": "你的 workspace_id (wrk_开头)",
-  "baidu_app_id": "",
-  "baidu_api_key": "",
-  "baidu_secret_key": ""
+  "ds_token": "你的 DeepSeek Bearer token"
 }
 ```
 
-### 获取配置信息
+### 获取 token
 
-1. 登录 [opencode.ai](https://opencode.ai)
+1. 登录 [platform.deepseek.com/usage](https://platform.deepseek.com/usage)
 2. 打开浏览器开发者工具 (F12) → 网络 (Network)
-3. 访问用量页面，抓取 `_server` 请求
-4. 从请求 URL 中提取 `id` 参数 → `server_id`
-5. 从请求头中提取 `Cookie` → `cookie`
-6. 从请求参数中提取 `args` 里的 workspace ID → `workspace_id`
+3. 刷新页面，找任意 `api/v0/` 开头的请求
+4. 复制请求头 `authorization` 中 `Bearer ` **后面**的部分（不要带 `Bearer ` 前缀）
+
+> token 是登录态凭据，有效期有限，过期后页面数据会显示"获取失败"，重新获取并更新配置即可。
 
 ## 编译与上传
 
@@ -81,14 +70,16 @@ pio run -e esp32-usage-monitor -t upload -t uploadfs
 
 ## 使用说明
 
-1. 首次启动进入 WiFi 配置界面
-2. 用三个按键输入 WiFi 密码：
-   - **按键A（左）**: 切换字符
-   - **按键B（中）**: 确认输入
-   - **按键Boot（右）**: 重置
-3. 连接 WiFi 后长按按键A（600ms）进入桌面
-4. 桌面自动每 60 秒刷新用量数据
-5. 按最左边按键可手动刷新
+1. 首次启动进入 WiFi 配置界面（自动扫描附近网络）
+2. 三个按键操作：
+   - **PWR（中）**: 列表中选下一个
+   - **IO18（左）**: 列表中选上一个
+   - **BOOT（右）**: 确认进入密码输入
+3. 软键盘输入密码：PWR/IO18 移动光标（长按连发），BOOT 输入字符；底行功能键为 模式切换 / 删除 / 空格 / OK
+4. 连接成功后进入用量页面，自动每 30 秒刷新
+5. 之后开机自动连接已保存的 WiFi；超过 10 秒连不上会自动回到 WiFi 配置界面
+6. 随时按 **BOOT** 可重新进入 WiFi 配置
+7. 用量页面按 **PWR** 手动刷新一次
 
 ## 项目结构
 
@@ -97,37 +88,33 @@ pio run -e esp32-usage-monitor -t upload -t uploadfs
 │   ├── config.json          # 运行时配置（已 gitignore）
 │   └── config.json.example  # 配置模板
 ├── src/
-│   ├── main.cpp             # 主循环和状态机
-│   ├── api_client.cpp/h     # OpenCode API 客户端
-│   ├── usage_display.cpp/h  # 用量显示界面
-│   ├── wifi_setup.cpp/h     # WiFi 配置界面
+│   ├── main.cpp             # 主循环：WiFi 状态机 + 30 秒刷新
+│   ├── deepseek_client.cpp/h# DeepSeek 用量/余额 API 客户端
+│   ├── usage_display.cpp/h  # 用量仪表盘界面
+│   ├── wifi_config.cpp/h    # WiFi 配置界面（扫描 + 软键盘）
 │   ├── config.h             # 配置结构体定义
-│   ├── audio_recorder.cpp/h # 录音（保留未使用）
-│   ├── usb_keyboard.cpp/h   # USB 键盘（保留未使用）
 │   └── hw/                  # 硬件驱动层
 │       ├── display.cpp/h    # AMOLED 显示驱动
 │       ├── input.cpp/h      # 按键和触摸输入
 │       ├── power.cpp/h      # 电源管理 (AXP2101)
-│       ├── audio.cpp/h      # 音频驱动 (ES8311)
 │       ├── imu.cpp/h        # 加速度计
 │       ├── rtc.cpp/h        # 实时时钟
 │       ├── expander.cpp/h   # IO 扩展器
 │       ├── border.cpp/h     # 边框绘制
 │       ├── net.cpp/h        # 网络工具
-│       ├── pins.h            # 引脚定义
+│       ├── pins.h           # 引脚定义
 │       └── hw.cpp/h         # 硬件初始化
-├── lib/                      # 本地库
-└── platformio.ini            # PlatformIO 配置
+└── platformio.ini           # PlatformIO 配置
 ```
 
 ## 注意事项
 
 - `data/config.json` 包含认证信息，已被 `.gitignore` 排除，不会上传到仓库
 - 每次修改 `config.json` 后需要重新上传文件系统：`pio run -e esp32-usage-monitor -t uploadfs`
-- Cookie 有效期有限，失效后需要从浏览器重新获取并更新配置
+- WiFi 凭据保存在 NVS 分区，与文件系统相互独立
 
 ## 友情链接
-- 同时还做了一个Windows上的用量显示悬浮窗，地址是：https://github.com/2700zc/TokenHub 配置好了之后，开箱即用
+- Windows 上的用量显示悬浮窗：[TokenHub](https://github.com/2700zc/TokenHub)，配置好之后开箱即用
 
 ## License
 
