@@ -1,384 +1,266 @@
 #include "usage_display.h"
 #include "hw/display.h"
-#include "hw/rtc.h"
-#include "hw/power.h"
 #include <cstdio>
-#include <cstdlib>
+#include <math.h>
+#include <time.h>
 #include <U8g2lib.h>
-#include <LittleFS.h>
 
 #define spr (*hwCanvas())
 
-static const uint16_t COL_BG    = 0x0000;
-static const uint16_t COL_TEXT  = 0xFFFF;
-static const uint16_t COL_DIM   = 0x4208;
-static const uint16_t COL_GREEN = 0x07E0;
-static const uint16_t COL_YELLOW= 0xFFE0;
-static const uint16_t COL_RED   = 0xF800;
+// ── 设计规范配色：AMOLED 纯黑 + 深灰卡片 + 蓝/青品牌色 ──
+static const uint16_t COL_BG     = 0x0000;  // #000000
+static const uint16_t COL_CARD   = 0x1083;  // #101018
+static const uint16_t COL_TEXT   = 0xF7BF;  // #F5F7FA
+static const uint16_t COL_TEXT2  = 0x8C73;  // #8A8F9B
+static const uint16_t COL_BLUE   = 0x4C7F;  // #4C8DFF DeepSeek 主色
+static const uint16_t COL_CYAN   = 0x6DFF;  // #00D9FF
+static const uint16_t COL_GREEN  = 0x4F96;  // #4FF0B0 亮绿（深底卡片上才清晰）
+static const uint16_t COL_RED    = 0xF800;
 
-static uint16_t accentColor(int pct) {
-  if (pct > 60) return COL_RED;
-  if (pct > 30) return COL_YELLOW;
-  return COL_GREEN;
+// 画布 184×224（2× 放大到物理 480×480）；边距 4 = 物理 8px，卡片几乎铺满
+static const int UI_M    = 4;
+static const int UI_CW   = 176;  // 184 - 2×4
+static const int UI_R    = 8;
+
+static uint16_t lerpColor(uint16_t c1, uint16_t c2, float t) {
+  if (t <= 0) return c1;
+  if (t >= 1) return c2;
+  int r1 = (c1 >> 11) & 31, g1 = (c1 >> 5) & 63, b1 = c1 & 31;
+  int r2 = (c2 >> 11) & 31, g2 = (c2 >> 5) & 63, b2 = c2 & 31;
+  int r = r1 + (int)((r2 - r1) * t);
+  int g = g1 + (int)((g2 - g1) * t);
+  int b = b1 + (int)((b2 - b1) * t);
+  return (r << 11) | (g << 5) | b;
 }
 
-static void drawIndeterminateBar(int x, int y, int w, uint32_t elapsedMs) {
-  int barW = w * 30 / 100;
-  uint32_t cycle = elapsedMs % 1000;
-  int pos = (int)(((int64_t)cycle * (w + barW)) / 1000) - barW;
-  int drawX = pos;
-  if (drawX < 0) drawX = 0;
-  if (drawX > w - barW) drawX = w - barW;
-  spr.fillRect(x, y, w, 4, COL_DIM);
-  spr.fillRect(x + drawX, y, barW, 4, COL_GREEN);
-}
-
-static void formatTime(char* buf, size_t sz, uint32_t sec) {
-  uint32_t d = sec / 86400; sec %= 86400;
-  uint32_t h = sec / 3600;  sec %= 3600;
-  uint32_t m = sec / 60;
-  if (d > 0) {
-    snprintf(buf, sz, "%lu天%lu小时%lu分", d, h, m);
-  } else if (h > 0) {
-    snprintf(buf, sz, "%lu小时%lu分", h, m);
-  } else {
-    snprintf(buf, sz, "%lu分", m);
+// 圆角对角线渐变卡片：左上亮 → 右下暗，圆角区域保留背景色
+static void drawGradCard(int y, int h, uint16_t c1, uint16_t c2) {
+  int r = UI_R;
+  for (int i = 0; i < h; i++) {
+    int x0 = UI_M, x1 = UI_M + UI_CW;
+    int dy = i < r ? r - i : (i > h - 1 - r ? i - (h - 1 - r) : 0);
+    if (dy > 0) {
+      int dx = (int)sqrtf((float)(r * r - dy * dy));
+      x0 += dx;
+      x1 -= dx;
+    }
+    if (x1 <= x0) continue;
+    float t0 = (float)i / (h - 1);
+    float t1 = (float)((x1 - 1 - UI_M) + i) / (UI_CW - 1 + h - 1);
+    uint16_t cStart = lerpColor(c1, c2, t0);
+    uint16_t cEnd   = lerpColor(c1, c2, t1);
+    for (int x = x0; x < x1; x++) {
+      float t = (float)(x - x0) / (x1 - 1 - x0);
+      spr.drawPixel(x, y + i, lerpColor(cStart, cEnd, t));
+    }
   }
 }
 
-static void drawBar(int x, int y, int w, int pct) {
-  spr.drawRect(x, y, w, 12, COL_DIM);
-  if (pct > 0) {
-    int fillW = (w - 2) * pct / 100;
-    if (fillW < 0) fillW = 0;
-    if (fillW > w - 2) fillW = w - 2;
-    spr.fillRect(x + 1, y + 1, fillW, 10, accentColor(pct));
+// 1/4 圆弧（顶部 120°），用于 WiFi 图标
+static void drawArc(int cx, int cy, int r, uint16_t color) {
+  for (int a = -60; a <= 60; a += 2) {
+    float rad = a * 3.14159f / 180.0f;
+    spr.drawPixel(cx + (int)(r * sinf(rad)), cy - (int)(r * cosf(rad)), color);
   }
 }
 
-void usageDisplayDraw(const UsageData& data, const char* ip) {
-  spr.fillScreen(COL_BG);
+static void drawWifiIcon(int x, int y) {
+  drawArc(x + 7, y + 6, 6, COL_BLUE);
+  drawArc(x + 7, y + 6, 3, COL_BLUE);
+  spr.fillCircle(x + 7, y + 6, 1, COL_BLUE);
+}
 
+static void drawWalletIcon(int x, int y, int s, uint16_t color) {
+  spr.drawRoundRect(x, y, s, s * 3 / 4, 3, color);
+  // 提手弧
+  for (int a = 0; a <= 180; a += 4) {
+    float rad = a * 3.14159f / 180.0f;
+    spr.drawPixel(x + s / 2 + (int)(s / 5.0f * cosf(rad)),
+                  y - (int)(s / 5.0f * sinf(rad)), color);
+  }
+  spr.drawCircle(x + s * 3 / 4, y + s * 3 / 8, 1, color);
+}
+
+// 装饰性上升趋势折线
+static void drawTrend(int x, int y) {
+  static const int8_t px[5] = { 0, 5, 9, 14, 18 };
+  static const int8_t py[5] = { 14, 10, 11, 4, 0 };
+  for (int i = 0; i < 4; i++)
+    spr.drawLine(x + px[i], y + py[i], x + px[i + 1], y + py[i + 1], COL_BLUE);
+  spr.fillCircle(x + px[4], y + py[4], 2, COL_CYAN);
+}
+
+// 完整数字 + 千分位；超过 15 字符（含逗号）退回"亿"缩写防溢出
+static void formatCount(char* buf, size_t sz, uint64_t v) {
+  char tmp[24];
+  snprintf(tmp, sizeof(tmp), "%llu", (unsigned long long)v);
+  int len = strlen(tmp);
+  int groups = (len - 1) / 3;
+  if (len + groups >= (int)sz || len + groups > 15) {
+    snprintf(buf, sz, "%.2f 亿", v / 100000000.0);
+    return;
+  }
+  int si = 0, oi = 0;
+  while (si < len) {
+    if (oi > 0 && (len - si) % 3 == 0) buf[oi++] = ',';
+    buf[oi++] = tmp[si++];
+  }
+  buf[oi] = 0;
+}
+
+static void formatHm(char* buf, size_t sz) {
+  time_t ts = time(nullptr);
+  if (ts < 100000) {
+    buf[0] = 0;
+    return;
+  }
+  struct tm lt;
+  localtime_r(&ts, &lt);
+  snprintf(buf, sz, "%02d:%02d", lt.tm_hour, lt.tm_min);
+}
+
+// 底部状态栏：WiFi 图标 + IP + 时间
+static void drawStatusBar(const char* ip) {
+  char hm[8];
+  formatHm(hm, sizeof(hm));
+  drawWifiIcon(UI_M, 216);
   spr.setFont(u8g2_font_wqy12_t_gb2312b);
-
-  struct Section {
-    const char* label;
-    int pct;
-    uint32_t resetSec;
-  } sections[3] = {
-    { "5小时用量",  data.rollingPercent,  data.rollingResetSec },
-    { "每周用量",  data.weeklyPercent,   data.weeklyResetSec },
-    { "每月用量",  data.monthlyPercent,  data.monthlyResetSec },
-  };
-
-  int labelY[] = { 30, 90, 150 };
-  int barY[]   = { 46, 106, 166 };
-  int resetY[] = { 68, 128, 188 };
-
-  for (int i = 0; i < 3; i++) {
-    const auto& sec = sections[i];
-
-    spr.setTextColor(COL_TEXT);
-    spr.setCursor(SAFE_L, labelY[i]);
-    spr.print(sec.label);
-
-    int pctVal = sec.pct;
-    if (!data.valid) pctVal = -1;
-
-    spr.setCursor(SAFE_R - 28, labelY[i]);
-    if (pctVal < 0) {
-      spr.print("N/A");
-    } else {
-      spr.printf("%d%%", pctVal);
-    }
-
-    drawBar(SAFE_L, barY[i], SAFE_W, data.valid ? pctVal : 0);
-
-    spr.setTextColor(COL_DIM);
-    spr.setCursor(SAFE_L, resetY[i]);
-    if (!data.valid) {
-      spr.print("暂无数据");
-    } else if (sec.resetSec == 0) {
-      spr.print("即将重置");
-    } else {
-      spr.print("距离重置:");
-      char buf[24];
-      formatTime(buf, sizeof(buf), sec.resetSec);
-      spr.print(buf);
-    }
-  }
-
-  if (ip && ip[0]) {
-    spr.setTextColor(COL_YELLOW);
-    spr.setCursor(SAFE_L, 200);
-    spr.printf("IP: %s", ip);
+  spr.setTextColor(COL_TEXT2);
+  spr.setCursor(UI_M + 20, 222);
+  if (ip && ip[0]) spr.print(ip);
+  if (hm[0]) {
+    spr.setCursor(UI_M + UI_CW - 34, 222);
+    spr.print(hm);
   }
 }
 
-void usageDisplayDrawDone(int steps, uint32_t elapsedMs) {
+void usageDisplayDrawDs(const DeepSeekUsage& data, const char* ip) {
   spr.fillScreen(COL_BG);
 
-  // 大号绿色对勾
-  spr.setFont(u8g2_font_wqy16_t_gb2312b);
-  spr.setTextColor(COL_GREEN);
-  int cx = SAFE_L + SAFE_W / 2;
-  spr.setCursor(cx - 12, SAFE_T + 60);
-  spr.print("OK");
+  char buf[24];
 
-  // "思考完成" 大字
-  spr.setCursor(cx - 40, SAFE_T + 100);
-  spr.print("思考完成");
-
-  // 统计信息
-  spr.setFont(u8g2_font_wqy14_t_gb2312b);
-  spr.setTextColor(COL_DIM);
-  spr.setCursor(cx - 50, SAFE_T + 135);
-  uint32_t sec = elapsedMs / 1000;
-  if (sec < 60) {
-    spr.printf("%d 步 · 用时 %us", steps, (unsigned int)sec);
-  } else if (sec < 3600) {
-    spr.printf("%d 步 · 用时 %um%us", steps, (unsigned int)(sec / 60), (unsigned int)(sec % 60));
-  } else {
-    spr.printf("%d 步 · 用时 %uh%um", steps, (unsigned int)(sec / 3600), (unsigned int)((sec % 3600) / 60));
-  }
-
-  // 倒计时提示
-  spr.setCursor(cx - 40, SAFE_T + 165);
-  spr.printf("%us 后返回...", (unsigned int)(2 - elapsedMs / 1000));
-}
-
-void usageDisplayDrawFailed(uint32_t elapsedMs) {
-  spr.fillScreen(COL_BG);
-
-  // 红色叉号
-  spr.setFont(u8g2_font_wqy16_t_gb2312b);
-  spr.setTextColor(COL_RED);
-  int cx = SAFE_L + SAFE_W / 2;
-  spr.setCursor(cx - 12, SAFE_T + 80);
-  spr.print("X");
-
-  // "任务失败" 大字
-  spr.setCursor(cx - 40, SAFE_T + 120);
-  spr.print("任务失败");
-
-  // 倒计时提示
-  spr.setFont(u8g2_font_wqy14_t_gb2312b);
-  spr.setTextColor(COL_DIM);
-  spr.setCursor(cx - 40, SAFE_T + 155);
-  spr.printf("%us 后返回...", (unsigned int)(2 - elapsedMs / 1000));
-}
-
-static const char* s_weekDays[7] = { "周日", "周一", "周二", "周三", "周四", "周五", "周六" };
-
-static uint16_t* s_img555 = nullptr;
-static int s_img555W = 0, s_img555H = 0;
-
-static bool loadImg555() {
-  if (s_img555) return true;
-  File f = LittleFS.open("/555.raw", "r");
-  if (!f) return false;
-  size_t sz = f.size();
-  s_img555 = (uint16_t*)malloc(sz);
-  if (!s_img555) { f.close(); return false; }
-  f.read((uint8_t*)s_img555, sz);
-  f.close();
-  s_img555W = 160;
-  s_img555H = 26;
-  return true;
-}
-
-static void drawLogo555(int cx, int cy) {
-  if (!loadImg555()) return;
-  spr.draw16bitRGBBitmap(cx - s_img555W / 2, cy - s_img555H / 2, s_img555, s_img555W, s_img555H);
-}
-
-void usageDisplayDrawTime(const char* ip, bool timeValid) {
-  spr.fillScreen(COL_BG);
-
-  HwTime t;
-  hwRtcRead(&t);
-
-  HwBattery bat = hwBattery();
-
-  if (!timeValid) {
-    spr.setFont(u8g2_font_wqy16_t_gb2312b);
-    spr.setTextColor(COL_DIM);
-    spr.setCursor(SAFE_L, 60);
-    spr.print("等待网络同步...");
-  } else {
-    spr.setFont(u8g2_font_wqy16_t_gb2312b);
-    spr.setTextColor(COL_TEXT);
-    spr.setCursor(SAFE_L, 35);
-    spr.printf("%02u:%02u:%02u", t.H, t.M, t.S);
-
-    spr.setFont(u8g2_font_wqy14_t_gb2312b);
-    spr.setTextColor(COL_DIM);
-    spr.setCursor(SAFE_L, 65);
-    spr.printf("%04u-%02u-%02u %s", t.Y, t.Mo, t.D, s_weekDays[t.dow]);
-
-    char pctBuf[32];
-    if (bat.charging) {
-      snprintf(pctBuf, sizeof(pctBuf), "%d%% 充电中", bat.pct);
-    } else if (bat.usbPresent) {
-      snprintf(pctBuf, sizeof(pctBuf), "%d%% 已充满", bat.pct);
-    } else {
-      snprintf(pctBuf, sizeof(pctBuf), "%d%%", bat.pct);
-    }
-    spr.setTextColor(bat.pct <= 20 ? COL_YELLOW : COL_TEXT);
-    spr.setCursor(SAFE_L, 90);
-    spr.print(pctBuf);
-
-    drawLogo555(SAFE_L + SAFE_W / 2, SAFE_T + SAFE_H - 40);
-  }
-
-  if (ip && ip[0]) {
-    spr.setFont(u8g2_font_wqy12_t_gb2312b);
-    spr.setTextColor(COL_YELLOW);
-    spr.setCursor(SAFE_L, 210);
-    spr.printf("IP: %s", ip);
-  }
-}
-
-void usageDisplayDrawEaster555(uint32_t elapsedMs) {
-  if (!loadImg555()) { spr.fillScreen(COL_BG); return; }
-  spr.fillScreen(COL_BG);
-  uint32_t cycle = elapsedMs % 200;
-  if (cycle < 100) {
-    int cx = SAFE_L + SAFE_W / 2;
-    int cy = SAFE_T + SAFE_H / 2;
-    spr.draw16bitRGBBitmap(cx - s_img555W / 2, cy - s_img555H / 2,
-                           s_img555, s_img555W, s_img555H);
-  }
-}
-
-void usageDisplayDrawThinking(uint32_t elapsedMs, int step, const char* msg) {
-  if (!loadImg555()) { spr.fillScreen(COL_BG); return; }
-  spr.fillScreen(COL_BG);
-
-  // 555 Logo 闪烁 (200ms 周期, 50% 占空比)
-  uint32_t logoCycle = elapsedMs % 200;
-  if (logoCycle < 100) {
-    int cx = SAFE_L + SAFE_W / 2;
-    spr.draw16bitRGBBitmap(cx - s_img555W / 2, SAFE_T + 24,
-                           s_img555, s_img555W, s_img555H);
-  }
-
-  // "思考中" 文字 + 省略号动画 (600ms 周期: 3/4/5个点)
+  // ── Header：logo + 品牌 + 时间 ──
+  spr.fillCircle(UI_M + 6, 15, 5, COL_BLUE);
   spr.setFont(u8g2_font_wqy16_t_gb2312b);
   spr.setTextColor(COL_TEXT);
-  spr.setCursor(SAFE_L + 20, SAFE_T + 90);
-  uint32_t dotCycle = (elapsedMs % 600) / 200;
-  spr.print("思考中");
-  for (uint32_t i = 0; i <= dotCycle; i++) spr.print(".");
+  spr.setCursor(UI_M + 18, 20);
+  spr.print("DeepSeek");
+  char hm[8];
+  formatHm(hm, sizeof(hm));
+  if (hm[0]) {
+    spr.setFont(u8g2_font_wqy12_t_gb2312b);
+    spr.setTextColor(COL_TEXT2);
+    spr.setCursor(UI_M + UI_CW - 34, 17);
+    spr.print(hm);
+  }
+  spr.setFont(u8g2_font_wqy12_t_gb2312b);
+  spr.setTextColor(COL_TEXT2);
+  spr.setCursor(UI_M, 36);
+  spr.print("今日用量");
 
-  // 不定长滚动进度条
-  drawIndeterminateBar(SAFE_L + 8, SAFE_T + 108, SAFE_W - 16, elapsedMs);
+  if (!data.valid) {
+    const char* reason;
+    switch (data.lastError) {
+      case dsErrNoToken: reason = "未配置 token"; break;
+      case dsErrNoTime:  reason = "时间未同步"; break;
+      case dsErrNetwork: reason = "网络连接失败"; break;
+      case dsErrHttp: {
+        char tmp[24];
+        snprintf(tmp, sizeof(tmp), "HTTP %d", data.lastHttp);
+        drawGradCard(84, 96, 0x220D, 0x0883);
+        spr.setFont(u8g2_font_wqy16_t_gb2312b);
+        spr.setTextColor(COL_RED);
+        spr.setCursor(UI_M + 16, 112);
+        spr.print("获取失败");
+        spr.setFont(u8g2_font_wqy12_t_gb2312b);
+        spr.setTextColor(COL_TEXT2);
+        spr.setCursor(UI_M + 16, 136);
+        spr.print(tmp);
+        spr.setCursor(UI_M + 16, 156);
+        spr.print("30 秒后自动重试");
+        drawStatusBar(ip);
+        return;
+      }
+      default: reason = "数据解析失败"; break;
+    }
+    drawGradCard(84, 96, 0x220D, 0x0883);
+    spr.setFont(u8g2_font_wqy16_t_gb2312b);
+    spr.setTextColor(COL_RED);
+    spr.setCursor(UI_M + 16, 112);
+    spr.print("获取失败");
+    spr.setFont(u8g2_font_wqy12_t_gb2312b);
+    spr.setTextColor(COL_TEXT2);
+    spr.setCursor(UI_M + 16, 136);
+    spr.print(reason);
+    if (data.lastDetail[0]) {
+      spr.setCursor(UI_M + 16, 156);
+      spr.print(data.lastDetail);
+    }
+    spr.setCursor(UI_M + 16, 172);
+    spr.print("30 秒后自动重试");
+    drawStatusBar(ip);
+    return;
+  }
 
-  // 步骤计数
-  spr.setFont(u8g2_font_wqy14_t_gb2312b);
+  // ── 卡片 1：今日请求数 ──
+  spr.fillRoundRect(UI_M, 44, UI_CW, 40, UI_R, COL_CARD);
+  spr.setFont(u8g2_font_wqy12_t_gb2312b);
+  spr.setTextColor(COL_TEXT2);
+  spr.setCursor(UI_M + 12, 56);
+  spr.print("今日请求数");
+  spr.setFont(u8g2_font_wqy12_t_gb2312b);
   spr.setTextColor(COL_TEXT);
-  spr.setCursor(SAFE_L + 8, SAFE_T + 130);
-  spr.printf("步骤 %d", step);
+  spr.setTextSize(2);
+  spr.setCursor(UI_M + 12, 80);
+  snprintf(buf, sizeof(buf), "%lu 次", (unsigned long)data.requestCount);
+  spr.print(buf);
+  spr.setTextSize(1);
+  drawTrend(UI_M + UI_CW - 28, 50);
 
-  // 操作描述 (如果有)
-  if (msg && msg[0]) {
-    spr.setFont(u8g2_font_wqy12_t_gb2312b);
-    spr.setTextColor(COL_DIM);
-    spr.setCursor(SAFE_L + 8, SAFE_T + 150);
-    char truncated[32];
-    snprintf(truncated, sizeof(truncated), "%.28s", msg);
-    spr.print(truncated);
-  }
+  // ── 卡片 2：今日 Tokens ──
+  spr.fillRoundRect(UI_M, 92, UI_CW, 40, UI_R, COL_CARD);
+  spr.setFont(u8g2_font_wqy12_t_gb2312b);
+  spr.setTextColor(COL_TEXT2);
+  spr.setCursor(UI_M + 12, 104);
+  spr.print("今日 Tokens");
+  spr.setFont(u8g2_font_wqy12_t_gb2312b);
+  spr.setTextColor(COL_TEXT);
+  spr.setCursor(UI_M + 12, 128);
+  formatCount(buf, sizeof(buf), data.tokenTotal);
+  // 数字超过 11 字符（2 倍字号 132px）时降为 1 倍字号防溢出
+  spr.setTextSize(strlen(buf) <= 11 ? 2 : 1);
+  spr.print(buf);
+  spr.setTextSize(1);
+  drawTrend(UI_M + UI_CW - 28, 98);
 
-  // 实时计时
-  spr.setFont(u8g2_font_wqy14_t_gb2312b);
-  spr.setTextColor(COL_DIM);
-  spr.setCursor(SAFE_L + 8, SAFE_T + 172);
-  uint32_t sec = elapsedMs / 1000;
-  if (sec < 60) {
-    spr.printf("已用: %us", (unsigned int)sec);
-  } else if (sec < 3600) {
-    spr.printf("已用: %um%us", (unsigned int)(sec / 60), (unsigned int)(sec % 60));
+  // ── 卡片 3：账户余额（视觉重点）──
+  drawGradCard(148, 64, 0x220D, 0x0883);
+  spr.setFont(u8g2_font_wqy12_t_gb2312b);
+  spr.setTextColor(COL_TEXT2);
+  spr.setCursor(UI_M + 12, 164);
+  spr.print("账户余额");
+  spr.setFont(u8g2_font_wqy16_t_gb2312b);
+  // 数字白色大字（最清晰），¥/元 同色；低于 5 元整体变红警示
+  spr.setTextColor(data.balance < 5.0 ? COL_RED : COL_TEXT);
+  spr.setCursor(UI_M + 12, 204);
+  char num[16];
+  snprintf(num, sizeof(num), "%.2f", data.balance);
+  int nlen = strlen(num);
+  if (strcmp(data.currency, "CNY") == 0) {
+    spr.setTextSize(1);
+    spr.print("¥");  // 货币符号小号，数字+单位尽量大
+    spr.setTextSize(nlen <= 7 ? 2 : 1);
+    spr.print(num);
+    spr.print(" ");
+    spr.print("元");
   } else {
-    spr.printf("已用: %uh%um", (unsigned int)(sec / 3600), (unsigned int)((sec % 3600) / 60));
+    spr.setTextSize(1);
+    spr.print("$");
+    spr.setTextSize(nlen <= 7 ? 2 : 1);
+    spr.print(num);
   }
-}
+  spr.setTextSize(1);
+  drawWalletIcon(UI_M + UI_CW - 30, 156, 24, COL_CYAN);
 
-void usageDisplayDrawRecorderRecording(uint32_t elapsedMs) {
-    spr.fillScreen(COL_BG);
-
-    spr.setFont(u8g2_font_wqy16_t_gb2312b);
-    spr.setTextColor(COL_RED);
-    int cx = SAFE_L + SAFE_W / 2;
-    spr.setCursor(cx - 36, SAFE_T + 50);
-    spr.print("录音中");
-
-    uint32_t dotCycle = (elapsedMs % 600) / 200;
-    for (uint32_t i = 0; i <= dotCycle; i++) spr.print(".");
-
-    spr.setFont(u8g2_font_wqy14_t_gb2312b);
-    spr.setTextColor(COL_DIM);
-    spr.setCursor(cx - 30, SAFE_T + 85);
-    uint32_t sec = elapsedMs / 1000;
-    if (sec < 30) {
-        spr.printf("%lus / 30s", (unsigned long)sec);
-    } else {
-        spr.print("即将停止...");
-    }
-
-    drawIndeterminateBar(SAFE_L + 8, SAFE_T + 105, SAFE_W - 16, elapsedMs);
-
-    spr.setFont(u8g2_font_wqy12_t_gb2312b);
-    spr.setTextColor(COL_DIM);
-    spr.setCursor(SAFE_L + 8, SAFE_T + 140);
-    spr.print("按 KEY2 停止录音");
-}
-
-void usageDisplayDrawRecorderUploading() {
-    spr.fillScreen(COL_BG);
-
-    spr.setFont(u8g2_font_wqy16_t_gb2312b);
-    spr.setTextColor(COL_YELLOW);
-    int cx = SAFE_L + SAFE_W / 2;
-    spr.setCursor(cx - 50, SAFE_T + 80);
-    spr.print("上传保存中...");
-
-    drawIndeterminateBar(SAFE_L + 8, SAFE_T + 105, SAFE_W - 16, millis());
-}
-
-void usageDisplayDrawRecorderDone(const char* path, uint32_t elapsedMs) {
-    spr.fillScreen(COL_BG);
-
-    spr.setFont(u8g2_font_wqy16_t_gb2312b);
-    spr.setTextColor(COL_GREEN);
-    int cx = SAFE_L + SAFE_W / 2;
-    spr.setCursor(cx - 48, SAFE_T + 30);
-    spr.print("已保存到 PC");
-
-    spr.setFont(u8g2_font_wqy14_t_gb2312b);
-    spr.setTextColor(COL_TEXT);
-    if (path && path[0]) {
-        spr.setCursor(SAFE_L + 8, SAFE_T + 65);
-        spr.printf("文件: %s", path);
-    }
-
-    spr.setFont(u8g2_font_wqy12_t_gb2312b);
-    spr.setTextColor(COL_DIM);
-    spr.setCursor(SAFE_L + 8, SAFE_T + SAFE_H - 20);
-    spr.printf("%us 后返回...", (unsigned int)(3 - elapsedMs / 1000));
-}
-
-void usageDisplayDrawRecorderFailed(uint32_t elapsedMs) {
-    spr.fillScreen(COL_BG);
-
-    spr.setFont(u8g2_font_wqy16_t_gb2312b);
-    spr.setTextColor(COL_RED);
-    int cx = SAFE_L + SAFE_W / 2;
-    spr.setCursor(cx - 36, SAFE_T + 80);
-    spr.print("保存失败");
-
-    spr.setFont(u8g2_font_wqy14_t_gb2312b);
-    spr.setTextColor(COL_DIM);
-    spr.setCursor(cx - 40, SAFE_T + 115);
-    spr.printf("%us 后返回...", (unsigned int)(3 - elapsedMs / 1000));
+  drawStatusBar(ip);
 }

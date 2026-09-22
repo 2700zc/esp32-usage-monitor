@@ -4,11 +4,7 @@
 #include <ArduinoJson.h>
 
 struct AppConfig {
-  char server_id[256];
-  char cookie[2048];
-  char workspace_id[128];
-  char pc_host[64];
-  uint16_t pc_port;
+  char ds_token[256];  // DeepSeek 平台 Bearer token（不含 "Bearer " 前缀）
   bool valid;
 };
 
@@ -25,11 +21,7 @@ inline bool loadConfig(AppConfig& cfg) {
     f.close(); return false;
   }
   f.close();
-  strlcpy(cfg.server_id,     doc["server_id"]     | "", sizeof(cfg.server_id));
-  strlcpy(cfg.cookie,        doc["cookie"]        | "", sizeof(cfg.cookie));
-  strlcpy(cfg.workspace_id,  doc["workspace_id"]  | "", sizeof(cfg.workspace_id));
-  strlcpy(cfg.pc_host,      doc["pc_host"]      | "", sizeof(cfg.pc_host));
-  cfg.pc_port = (uint16_t)(doc["pc_port"] | 12345);
-  cfg.valid = cfg.server_id[0] != 0;
+  strlcpy(cfg.ds_token, doc["ds_token"] | "", sizeof(cfg.ds_token));
+  cfg.valid = cfg.ds_token[0] != 0;
   return true;
 }

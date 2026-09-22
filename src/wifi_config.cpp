@@ -60,6 +60,9 @@ static void doScan(WfConfig& cfg) {
     spr.setCursor(SAFE_L, SAFE_T + 100);
     spr.print("WiFi...");
     hwDisplayPush();
+    // 停止旧的自动连接/重连循环，否则 scanNetworks 会被干扰而失败（空列表）
+    WiFi.disconnect(true);
+    delay(100);
     cfg.networkCount = netScan(cfg.networks, 8);
     cfg.listSel = 0;
     cfg.scrollOff = 0;
@@ -259,6 +262,10 @@ bool wfTick(WfConfig& cfg) {
 
     if (cfg.state == WfState::ScanList) {
         if (a.wasPressed) {
+            if (cfg.networkCount == 0) {
+                cfg.state = WfState::Scanning;  // 空列表：按 PWR 重新扫描
+                return false;
+            }
             cfg.listSel++;
             if (cfg.listSel >= cfg.networkCount) cfg.listSel = 0;
         }
