@@ -1,32 +1,31 @@
 #include "deepseek_client.h"
+#include "http_client.h"
 #include <Arduino.h>
 #include <ArduinoJson.h>
-#include <WiFiClientSecure.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 static const char* DS_HOST = "platform.deepseek.com";
 
 // 鉴权实测结论：Authorization: Bearer 是唯一凭据，cookie 不需要；
 // 但 User-Agent / Referer / x-client-* 头缺失会被 WAF 以 429 拦截，必须全带。
-static void sendHeaders(WiFiClientSecure& client, const char* token, const char* path) {
-  client.print("GET ");
-  client.print(path);
-  client.println(" HTTP/1.1");
-  client.print("Host: ");
-  client.println(DS_HOST);
-  client.println("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36 Edg/152.0.0.0");
-  client.println("Accept: */*");
-  client.println("Referer: https://platform.deepseek.com/usage");
-  client.print("Authorization: Bearer ");
-  client.println(token);
-  client.println("x-client-bundle-id: com.deepseek.chat");
-  client.println("x-client-locale: zh_CN");
-  client.println("x-client-platform: web");
-  client.println("x-client-timezone-offset: 28800");
-  client.println("x-client-version: 1.0.0");
-  client.println("Connection: close");
-  client.println();
+static int httpGet(const char* path, const char* token, String& body) {
+  char auth[288];
+  snprintf(auth, sizeof(auth), "Bearer %s", token);
+
+  HttpHeader h[] = {
+    {"User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36 Edg/152.0.0.0"},
+    {"Accept", "*/*"},
+    {"Referer", "https://platform.deepseek.com/usage"},
+    {"Authorization", auth},
+    {"x-client-bundle-id", "com.deepseek.chat"},
+    {"x-client-locale", "zh_CN"},
+    {"x-client-platform", "web"},
+    {"x-client-timezone-offset", "28800"},
+    {"x-client-version", "1.0.0"},
+  };
+  return httpGetSecure("ds", DS_HOST, path, h, sizeof(h) / sizeof(h[0]), body);
 }
 
 // 东八区今天 0 点的 UTC 秒；NTP 未同步时返回 0
@@ -36,61 +35,6 @@ static uint32_t todayStartSec() {
   struct tm lt;
   localtime_r(&ts, &lt);
   return (uint32_t)(ts - (lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec));
-}
-
-// GET 请求，成功返回 HTTP 状态码并填充 body；TCP/TLS 失败返回 0
-static int httpGet(const char* path, const char* token, String& body) {
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(10000);
-
-  if (!client.connect(DS_HOST, 443, 10000)) {
-    Serial.printf("ds: connect %s failed\n", DS_HOST);
-    return 0;
-  }
-
-  sendHeaders(client, token, path);
-
-  // 按 Content-Length 精确读取：TLS 下 connected() 在 FIN 到达时可能
-  // 提前返回 false，导致最后一段数据丢失（表现为 json:incompleteInput）
-  uint32_t start = millis();
-  String response;
-  int headerEnd = -1;
-  int contentLength = -1;
-  while (millis() - start < 10000) {
-    while (client.available()) {
-      response += (char)client.read();
-      if (response.length() > 65536) break;
-    }
-    if (headerEnd < 0) {
-      headerEnd = response.indexOf("\r\n\r\n");
-      if (headerEnd >= 0) {
-        int clIdx = response.indexOf("Content-Length:");
-        if (clIdx >= 0 && clIdx < headerEnd)
-          contentLength = atoi(response.c_str() + clIdx + 15);
-      }
-    }
-    int bodyLen = headerEnd >= 0 ? response.length() - (headerEnd + 4) : 0;
-    if (headerEnd >= 0 && (contentLength >= 0 ? bodyLen >= contentLength : !client.connected()))
-      break;
-    if (headerEnd < 0 && !client.connected()) break;
-    delay(1);
-  }
-  // 连接关闭后清空残余缓冲
-  while (client.available() && millis() - start < 10000) {
-    response += (char)client.read();
-  }
-  client.stop();
-
-  if (headerEnd < 0) return 0;
-  int status = atoi(response.c_str() + response.indexOf(' ') + 1);
-  if (contentLength > 0) {
-    body = response.substring(headerEnd + 4, headerEnd + 4 + contentLength);
-  } else {
-    body = response.substring(headerEnd + 4);
-  }
-  Serial.printf("ds: %s -> HTTP %d, %d bytes (cl=%d)\n", path, status, body.length(), contentLength);
-  return status;
 }
 
 static bool parseAmount(const String& body, DeepSeekUsage& out) {
@@ -166,7 +110,8 @@ static bool parseSummary(const String& body, DeepSeekUsage& out) {
 }
 
 bool dsFetchToday(DeepSeekUsage& out, const char* token) {
-  out.valid = false;
+  // 失败时不清 valid：界面上继续显示上一次成功的数据，只在页头标出失败原因与
+  // 数据年龄。首次获取就失败时 valid 本来就是 false，会走整页错误提示。
   out.lastError = dsErrOk;
   out.lastHttp = 0;
   if (!token || !token[0]) {

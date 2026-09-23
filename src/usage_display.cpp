@@ -1,26 +1,45 @@
 #include "usage_display.h"
 #include "hw/display.h"
+#include <Arduino.h>
 #include <cstdio>
 #include <math.h>
+#include <string.h>
 #include <time.h>
 #include <U8g2lib.h>
 
 #define spr (*hwCanvas())
 
-// ── 设计规范配色：AMOLED 纯黑 + 深灰卡片 + 蓝/青品牌色 ──
-static const uint16_t COL_BG     = 0x0000;  // #000000
-static const uint16_t COL_CARD   = 0x1083;  // #101018
-static const uint16_t COL_TEXT   = 0xF7BF;  // #F5F7FA
-static const uint16_t COL_TEXT2  = 0x8C73;  // #8A8F9B
-static const uint16_t COL_BLUE   = 0x4C7F;  // #4C8DFF DeepSeek 主色
-static const uint16_t COL_CYAN   = 0x6DFF;  // #00D9FF
-static const uint16_t COL_GREEN  = 0x4F96;  // #4FF0B0 亮绿（深底卡片上才清晰）
-static const uint16_t COL_RED    = 0xF800;
+// ── 设计规范配色：AMOLED 纯黑 + 深灰卡片 + 品牌色 ──
+static const uint16_t COL_BG      = 0x0000;  // #000000
+static const uint16_t COL_CARD    = 0x1083;  // #101018
+static const uint16_t COL_TEXT    = 0xF7BF;  // #F5F7FA
+static const uint16_t COL_TEXT2   = 0x8C73;  // #8A8F9B
+static const uint16_t COL_BLUE    = 0x4C7F;  // #4C8DFF DeepSeek 主色
+static const uint16_t COL_RED     = 0xF800;  // 警示色 / 获取失败
+static const uint16_t COL_AMBER   = 0xFD20;  // #FFA020 数据已过期
+static const uint16_t COL_DOT_OFF = 0x52AA;  // #555555 未选中的页码点
+// TokenHub 里三个服务商的强调色，转 RGB565
+static const uint16_t COL_OC      = 0x1BBA;  // #1976d2 OpenCode Go
+static const uint16_t COL_CC      = 0x044F;  // #00897b CommandCode
 
 // 画布 184×224（2× 放大到物理 480×480）；边距 4 = 物理 8px，卡片几乎铺满
-static const int UI_M    = 4;
-static const int UI_CW   = 176;  // 184 - 2×4
-static const int UI_R    = 8;
+static const int UI_M  = 4;
+static const int UI_CW = 176;  // 184 - 2×4
+static const int UI_R  = 8;
+
+// ── 行高来自固件二进制里读出的 u8g2 真实度量，不是估算 ──
+//   wqy12 size1: 基线以上 11px / 以下 2px -> 13px
+//   wqy12 size2: 基线以上 22px / 以下 4px -> 26px
+//   wqy16 size1: 基线以上 14px / 以下 4px -> 18px
+//   wqy16 size2: 基线以上 28px / 以下 8px -> 36px
+// 数值用 wqy12 size2（26px），只保留两行，基线写死如下。
+static const int CARD_Y[3] = { 42, 96, 150 };
+static const int CARD_H    = 52;
+static const int ROW1_BASE = 17;  // 标签 + 右侧次要信息：占 y+6..y+19
+static const int ROW2_BASE = 47;  // 数值：占 y+25..y+51
+static const int VALUE_MAX_W = UI_CW - 16;  // 数值可用宽度（左 10 + 右 6 余量）
+
+// ── 通用绘制件 ──
 
 static uint16_t lerpColor(uint16_t c1, uint16_t c2, float t) {
   if (t <= 0) return c1;
@@ -70,26 +89,6 @@ static void drawWifiIcon(int x, int y) {
   spr.fillCircle(x + 7, y + 6, 1, COL_BLUE);
 }
 
-static void drawWalletIcon(int x, int y, int s, uint16_t color) {
-  spr.drawRoundRect(x, y, s, s * 3 / 4, 3, color);
-  // 提手弧
-  for (int a = 0; a <= 180; a += 4) {
-    float rad = a * 3.14159f / 180.0f;
-    spr.drawPixel(x + s / 2 + (int)(s / 5.0f * cosf(rad)),
-                  y - (int)(s / 5.0f * sinf(rad)), color);
-  }
-  spr.drawCircle(x + s * 3 / 4, y + s * 3 / 8, 1, color);
-}
-
-// 装饰性上升趋势折线
-static void drawTrend(int x, int y) {
-  static const int8_t px[5] = { 0, 5, 9, 14, 18 };
-  static const int8_t py[5] = { 14, 10, 11, 4, 0 };
-  for (int i = 0; i < 4; i++)
-    spr.drawLine(x + px[i], y + py[i], x + px[i + 1], y + py[i + 1], COL_BLUE);
-  spr.fillCircle(x + px[4], y + py[4], 2, COL_CYAN);
-}
-
 // 完整数字 + 千分位；超过 15 字符（含逗号）退回"亿"缩写防溢出
 static void formatCount(char* buf, size_t sz, uint64_t v) {
   char tmp[24];
@@ -119,6 +118,29 @@ static void formatHm(char* buf, size_t sz) {
   snprintf(buf, sz, "%02d:%02d", lt.tm_hour, lt.tm_min);
 }
 
+// 距上次成功获取过去了多久。用相对时长而不是绝对时刻：设备没同步 NTP 时绝对
+// 时刻会显示成 1970，而"多久之前"也更能一眼看出数据有多旧。
+static void formatAge(char* buf, size_t sz, uint32_t fetchedAtMs) {
+  if (fetchedAtMs == 0) { strlcpy(buf, "--", sz); return; }
+  uint32_t sec = (millis() - fetchedAtMs) / 1000;
+  if (sec < 90)        strlcpy(buf, "刚刚", sz);
+  else if (sec < 3600) snprintf(buf, sz, "%lu 分钟前", (unsigned long)(sec / 60));
+  else                 snprintf(buf, sz, "%lu 小时前", (unsigned long)(sec / 3600));
+}
+
+// u8g2 的 wqy 系列是定宽字体：ASCII 前进 = cell/2，CJK（含 ¥ 与 ·） = cell。
+// 直接量宽度比按字符数猜可靠——中英混排时字符数会明显低估。
+static int textWidth(const char* s, int cell, int size) {
+  int w = 0;
+  for (const unsigned char* p = (const unsigned char*)s; *p; ) {
+    if (*p < 0x80)               { w += cell / 2; p += 1; }
+    else if ((*p & 0xE0) == 0xC0) { w += cell;     p += 2; }
+    else if ((*p & 0xF0) == 0xE0) { w += cell;     p += 3; }
+    else                          { w += cell;     p += 4; }
+  }
+  return w * size;
+}
+
 // 底部状态栏：WiFi 图标 + IP + 时间
 static void drawStatusBar(const char* ip) {
   char hm[8];
@@ -134,17 +156,24 @@ static void drawStatusBar(const char* ip) {
   }
 }
 
-void usageDisplayDrawDs(const DeepSeekUsage& data, const char* ip) {
-  spr.fillScreen(COL_BG);
+// 页码圆点，当前页高亮。单页不画。
+static void drawPageDots(int page, int count) {
+  if (count <= 1) return;
+  const int pitch = 7, r = 2, y = 208;
+  int width = (count - 1) * pitch + (2 * r + 1);
+  int x0 = (HW_W - width) / 2 + r;
+  for (int i = 0; i < count; i++)
+    spr.fillCircle(x0 + i * pitch, y, r, i == page ? COL_TEXT : COL_DOT_OFF);
+}
 
-  char buf[24];
-
-  // ── Header：logo + 品牌 + 时间 ──
-  spr.fillCircle(UI_M + 6, 15, 5, COL_BLUE);
+// 页头：品牌点 + 服务商名 + 右上时间 + 副标题
+static void drawHeader(const char* name, uint16_t accent, const char* subtitle, uint16_t subColor) {
+  spr.fillCircle(UI_M + 6, 15, 5, accent);
   spr.setFont(u8g2_font_wqy16_t_gb2312b);
   spr.setTextColor(COL_TEXT);
   spr.setCursor(UI_M + 18, 20);
-  spr.print("DeepSeek");
+  spr.print(name);
+
   char hm[8];
   formatHm(hm, sizeof(hm));
   if (hm[0]) {
@@ -154,113 +183,269 @@ void usageDisplayDrawDs(const DeepSeekUsage& data, const char* ip) {
     spr.print(hm);
   }
   spr.setFont(u8g2_font_wqy12_t_gb2312b);
-  spr.setTextColor(COL_TEXT2);
+  spr.setTextColor(subColor);
   spr.setCursor(UI_M, 36);
-  spr.print("今日用量");
+  spr.print(subtitle);
+}
+
+// 页头副标题的两种形态：正常时是静态副标题；上次刷新失败时换成琥珀色的
+// 「失败原因 · 数据年龄」——页面照常显示历史数据，靠这一行区分新旧。
+// 一行只有 174px，放不下「原因 · 年龄」时就只留原因（各原因的宽度已核过，都能放下）。
+static void drawHeaderStatus(const char* name, uint16_t accent, const char* subtitle,
+                             const char* failReason, uint32_t fetchedAt) {
+  const int MAX_W = 174;
+  char buf[44];
+  const char* text = subtitle;
+  uint16_t color = COL_TEXT2;
+  if (failReason && fetchedAt != 0) {
+    char age[16];
+    formatAge(age, sizeof(age), fetchedAt);
+    snprintf(buf, sizeof(buf), "%s · %s", failReason, age);
+    if (textWidth(buf, 12, 1) > MAX_W) snprintf(buf, sizeof(buf), "%s", failReason);
+    text = buf;
+    color = COL_AMBER;
+  }
+  drawHeader(name, accent, text, color);
+}
+
+// 整页提示卡片：只在「从没成功获取过」时用。
+// 行距按 wqy16 size1（18px）与 wqy12 size1（13px）排，互不重叠。
+static void drawStatusBody(const char* title, uint16_t titleColor, const char* reason,
+                           const char* detail, const char* ip, int page, int pageCount) {
+  drawGradCard(76, 104, 0x220D, 0x0883);
+  spr.setFont(u8g2_font_wqy16_t_gb2312b);
+  spr.setTextColor(titleColor);
+  spr.setCursor(UI_M + 16, 106);
+  spr.print(title);
+
+  spr.setFont(u8g2_font_wqy12_t_gb2312b);
+  spr.setTextColor(COL_TEXT2);
+  spr.setCursor(UI_M + 16, 132);
+  spr.print(reason);
+  if (detail && detail[0]) {
+    spr.setCursor(UI_M + 16, 152);
+    spr.print(detail);
+  }
+  spr.setCursor(UI_M + 16, 172);
+  spr.print("60 秒后自动重试");
+
+  drawPageDots(page, pageCount);
+  drawStatusBar(ip);
+}
+
+// ── 卡片：第 1 行「标签 + 右侧次要信息」，第 2 行「大号数值」 ──
+
+static void drawCardBase(int y) {
+  spr.fillRoundRect(UI_M, y, UI_CW, CARD_H, UI_R, COL_CARD);
+}
+
+// 标签行。右侧文本（重置倒计时 / 币种 / 刷新说明）右对齐；若会压到标签则整条不画，
+// 宁可少一行也不叠字。
+static void drawCardRow1(int y, const char* label, const char* right) {
+  spr.setFont(u8g2_font_wqy12_t_gb2312b);
+  spr.setTextColor(COL_TEXT2);
+  spr.setCursor(UI_M + 10, y + ROW1_BASE);
+  spr.print(label);
+
+  if (!right || !right[0]) return;
+  int w = textWidth(right, 12, 1);
+  int x = UI_M + UI_CW - 10 - w;
+  if (x < UI_M + 10 + textWidth(label, 12, 1) + 6) return;
+  spr.setCursor(x, y + ROW1_BASE);
+  spr.print(right);
+}
+
+// 数值行。默认 wqy12 的 2 倍字号；放不下（超过 13 个字符宽）时降回 1 倍，
+// 同时把基线压低，否则小字号会浮在行中间。
+static void drawCardValue(int y, const char* value, uint16_t color) {
+  bool big = textWidth(value, 12, 2) <= VALUE_MAX_W;
+  spr.setFont(u8g2_font_wqy12_t_gb2312b);
+  spr.setTextSize(big ? 2 : 1);
+  spr.setTextColor(color);
+  spr.setCursor(UI_M + 10, y + (big ? ROW2_BASE : 40));
+  spr.print(value);
+  spr.setTextSize(1);
+}
+
+// 用量百分比卡片。无上限 / 无额度时数值显示 --，原因写在标签行右侧。
+static void drawUsageCard(int y, const char* label, const UsageSegment& seg, uint16_t accent) {
+  drawCardBase(y);
+
+  char right[24];
+  right[0] = 0;
+  if (strcmp(seg.status, "unlimited") == 0) {
+    strlcpy(right, "无上限", sizeof(right));
+  } else if (strcmp(seg.status, "unavailable") == 0) {
+    strlcpy(right, "额度不可用", sizeof(right));
+  } else if (seg.valid) {
+    usageFormatResetShort(right, sizeof(right), seg.resetSec);
+  }
+
+  char buf[24];
+  if (seg.valid) {
+    // 整数不带小数位，与 TokenHub 的 _fmt_cc_pct 一致
+    if (seg.percent >= 100.0f)                snprintf(buf, sizeof(buf), "100%%");
+    else if (seg.percent == (float)(int)seg.percent)
+                                              snprintf(buf, sizeof(buf), "%d%%", (int)seg.percent);
+    else                                      snprintf(buf, sizeof(buf), "%.1f%%", seg.percent);
+  } else {
+    strlcpy(buf, "--", sizeof(buf));
+  }
+
+  // 达到 100% 用红色警示——TokenHub 无阈值配色，这里按小屏可读性补上
+  drawCardValue(y, buf, seg.valid && seg.percent >= 100.0f ? COL_RED : accent);
+  drawCardRow1(y, label, right);
+}
+
+// ── 三个页面 ──
+
+void usageDisplayDrawOc(const OpenCodeUsage& data, const char* ip, int page, int pageCount,
+                        const char* netStatus) {
+  spr.fillScreen(COL_BG);
+
+  char httpTxt[16] = "";
+  const char* reason = nullptr;   // nullptr = 上一次刷新是成功的
+  const char* detail = data.lastDetail;
+  switch (data.lastError) {
+    case ocErrNoToken: reason = "未配置凭据"; break;
+    case ocErrNetwork: reason = "网络连接失败"; break;
+    case ocErrAuth:    reason = "cookie 已过期";
+                       detail = "重新复制后重刷文件系统"; break;
+    case ocErrHttp:    snprintf(httpTxt, sizeof(httpTxt), "HTTP %d", data.lastHttp);
+                       reason = httpTxt; break;
+    case ocErrParse:   reason = "数据解析失败"; break;
+    default:           break;     // ocErrOk
+  }
+  if (netStatus) reason = netStatus;
 
   if (!data.valid) {
-    const char* reason;
-    switch (data.lastError) {
-      case dsErrNoToken: reason = "未配置 token"; break;
-      case dsErrNoTime:  reason = "时间未同步"; break;
-      case dsErrNetwork: reason = "网络连接失败"; break;
-      case dsErrHttp: {
-        char tmp[24];
-        snprintf(tmp, sizeof(tmp), "HTTP %d", data.lastHttp);
-        drawGradCard(84, 96, 0x220D, 0x0883);
-        spr.setFont(u8g2_font_wqy16_t_gb2312b);
-        spr.setTextColor(COL_RED);
-        spr.setCursor(UI_M + 16, 112);
-        spr.print("获取失败");
-        spr.setFont(u8g2_font_wqy12_t_gb2312b);
-        spr.setTextColor(COL_TEXT2);
-        spr.setCursor(UI_M + 16, 136);
-        spr.print(tmp);
-        spr.setCursor(UI_M + 16, 156);
-        spr.print("30 秒后自动重试");
-        drawStatusBar(ip);
-        return;
-      }
-      default: reason = "数据解析失败"; break;
-    }
-    drawGradCard(84, 96, 0x220D, 0x0883);
-    spr.setFont(u8g2_font_wqy16_t_gb2312b);
-    spr.setTextColor(COL_RED);
-    spr.setCursor(UI_M + 16, 112);
-    spr.print("获取失败");
-    spr.setFont(u8g2_font_wqy12_t_gb2312b);
-    spr.setTextColor(COL_TEXT2);
-    spr.setCursor(UI_M + 16, 136);
-    spr.print(reason);
-    if (data.lastDetail[0]) {
-      spr.setCursor(UI_M + 16, 156);
-      spr.print(data.lastDetail);
-    }
-    spr.setCursor(UI_M + 16, 172);
-    spr.print("30 秒后自动重试");
-    drawStatusBar(ip);
+    // 从没成功过：整页提示。页头保持静态副标题，原因只写在卡片里，避免重复
+    drawHeader("OpenCode Go", COL_OC, "用量窗口", COL_TEXT2);
+    drawStatusBody(reason ? "获取失败" : "正在获取", reason ? COL_RED : COL_TEXT2,
+                   reason ? reason : "等待首次刷新", detail, ip, page, pageCount);
     return;
   }
 
-  // ── 卡片 1：今日请求数 ──
-  spr.fillRoundRect(UI_M, 44, UI_CW, 40, UI_R, COL_CARD);
-  spr.setFont(u8g2_font_wqy12_t_gb2312b);
-  spr.setTextColor(COL_TEXT2);
-  spr.setCursor(UI_M + 12, 56);
-  spr.print("今日请求数");
-  spr.setFont(u8g2_font_wqy12_t_gb2312b);
-  spr.setTextColor(COL_TEXT);
-  spr.setTextSize(2);
-  spr.setCursor(UI_M + 12, 80);
-  snprintf(buf, sizeof(buf), "%lu 次", (unsigned long)data.requestCount);
-  spr.print(buf);
-  spr.setTextSize(1);
-  drawTrend(UI_M + UI_CW - 28, 50);
+  drawHeaderStatus("OpenCode Go", COL_OC, "用量窗口", reason, data.fetchedAt);
+  drawUsageCard(CARD_Y[0], "滚动用量", data.rolling, COL_OC);
+  drawUsageCard(CARD_Y[1], "每周用量", data.weekly,  COL_OC);
+  drawUsageCard(CARD_Y[2], "每月用量", data.monthly, COL_OC);
+  drawPageDots(page, pageCount);
+  drawStatusBar(ip);
+}
 
-  // ── 卡片 2：今日 Tokens ──
-  spr.fillRoundRect(UI_M, 92, UI_CW, 40, UI_R, COL_CARD);
-  spr.setFont(u8g2_font_wqy12_t_gb2312b);
-  spr.setTextColor(COL_TEXT2);
-  spr.setCursor(UI_M + 12, 104);
-  spr.print("今日 Tokens");
-  spr.setFont(u8g2_font_wqy12_t_gb2312b);
-  spr.setTextColor(COL_TEXT);
-  spr.setCursor(UI_M + 12, 128);
-  formatCount(buf, sizeof(buf), data.tokenTotal);
-  // 数字超过 11 字符（2 倍字号 132px）时降为 1 倍字号防溢出
-  spr.setTextSize(strlen(buf) <= 11 ? 2 : 1);
-  spr.print(buf);
-  spr.setTextSize(1);
-  drawTrend(UI_M + UI_CW - 28, 98);
+void usageDisplayDrawCc(const CommandCodeUsage& data, const char* ip, int page, int pageCount,
+                        const char* netStatus) {
+  spr.fillScreen(COL_BG);
 
-  // ── 卡片 3：账户余额（视觉重点）──
-  drawGradCard(148, 64, 0x220D, 0x0883);
-  spr.setFont(u8g2_font_wqy12_t_gb2312b);
-  spr.setTextColor(COL_TEXT2);
-  spr.setCursor(UI_M + 12, 164);
-  spr.print("账户余额");
-  spr.setFont(u8g2_font_wqy16_t_gb2312b);
-  // 数字白色大字（最清晰），¥/元 同色；低于 5 元整体变红警示
-  spr.setTextColor(data.balance < 5.0 ? COL_RED : COL_TEXT);
-  spr.setCursor(UI_M + 12, 204);
+  char httpTxt[16] = "";
+  const char* reason = nullptr;
+  const char* detail = data.lastDetail;
+  switch (data.lastError) {
+    case ccErrNoToken: reason = "未配置凭据"; break;
+    case ccErrNetwork: reason = "网络连接失败"; break;
+    case ccErrAuth:    reason = "token 已过期";
+                       detail = "重新复制后重刷文件系统"; break;
+    case ccErrHttp:    snprintf(httpTxt, sizeof(httpTxt), "HTTP %d", data.lastHttp);
+                       reason = httpTxt; break;
+    case ccErrParse:   reason = "数据解析失败"; break;
+    default:           break;     // ccErrOk
+  }
+  if (netStatus) reason = netStatus;
+
+  if (!data.valid) {
+    drawHeader("CommandCode", COL_CC, "用量窗口", COL_TEXT2);
+    drawStatusBody(reason ? "获取失败" : "正在获取", reason ? COL_RED : COL_TEXT2,
+                   reason ? reason : "等待首次刷新", detail, ip, page, pageCount);
+    return;
+  }
+
+  drawHeaderStatus("CommandCode", COL_CC, "用量窗口", reason, data.fetchedAt);
+  drawUsageCard(CARD_Y[0], "滚动用量", data.fiveHour, COL_CC);
+  drawUsageCard(CARD_Y[1], "每周用量", data.weekly,   COL_CC);
+  drawUsageCard(CARD_Y[2], "每月用量", data.monthly,  COL_CC);
+  drawPageDots(page, pageCount);
+  drawStatusBar(ip);
+}
+
+// 余额卡片：¥/$ 符号用 1 倍字号、数字尽量大；低于 5 元整体变红警示
+static void drawDsBalanceCard(int y, const DeepSeekUsage& data) {
+  drawGradCard(y, CARD_H, 0x220D, 0x0883);
+
   char num[16];
   snprintf(num, sizeof(num), "%.2f", data.balance);
-  int nlen = strlen(num);
-  if (strcmp(data.currency, "CNY") == 0) {
-    spr.setTextSize(1);
-    spr.print("¥");  // 货币符号小号，数字+单位尽量大
-    spr.setTextSize(nlen <= 7 ? 2 : 1);
-    spr.print(num);
-    spr.print(" ");
-    spr.print("元");
-  } else {
-    spr.setTextSize(1);
-    spr.print("$");
-    spr.setTextSize(nlen <= 7 ? 2 : 1);
-    spr.print(num);
-  }
-  spr.setTextSize(1);
-  drawWalletIcon(UI_M + UI_CW - 30, 156, 24, COL_CYAN);
+  const char* sym = strcmp(data.currency, "CNY") == 0 ? "¥" : "$";
 
+  // 币种写在右侧，所以不再重复"元"
+  drawCardRow1(y, "账户余额", data.currency);
+
+  bool big = textWidth(sym, 12, 1) + textWidth(num, 12, 2) <= VALUE_MAX_W;
+  spr.setFont(u8g2_font_wqy12_t_gb2312b);
+  spr.setTextColor(data.balance < 5.0 ? COL_RED : COL_TEXT);
+  spr.setCursor(UI_M + 10, y + (big ? ROW2_BASE : 40));
+  spr.setTextSize(1);
+  spr.print(sym);
+  spr.setTextSize(big ? 2 : 1);
+  spr.print(num);
+  spr.setTextSize(1);
+}
+
+void usageDisplayDrawDs(const DeepSeekUsage& data, const char* ip, int page, int pageCount,
+                        const char* netStatus) {
+  spr.fillScreen(COL_BG);
+
+  char httpTxt[16] = "";
+  const char* reason = nullptr;
+  switch (data.lastError) {
+    case dsErrNoToken: reason = "未配置 token"; break;
+    case dsErrNoTime:  reason = "时间未同步"; break;
+    case dsErrNetwork: reason = "网络连接失败"; break;
+    case dsErrHttp:    snprintf(httpTxt, sizeof(httpTxt), "HTTP %d", data.lastHttp);
+                       reason = httpTxt; break;
+    case dsErrParse:   reason = "数据解析失败"; break;
+    default:           break;     // dsErrOk
+  }
+  if (netStatus) reason = netStatus;
+
+  if (!data.valid) {
+    drawHeader("DeepSeek", COL_BLUE, "今日用量", COL_TEXT2);
+    drawStatusBody(reason ? "获取失败" : "正在获取", reason ? COL_RED : COL_TEXT2,
+                   reason ? reason : "等待首次刷新", data.lastDetail, ip, page, pageCount);
+    return;
+  }
+
+  drawHeaderStatus("DeepSeek", COL_BLUE, "今日用量", reason, data.fetchedAt);
+
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%lu 次", (unsigned long)data.requestCount);
+  drawCardBase(CARD_Y[0]);
+  drawCardValue(CARD_Y[0], buf, COL_TEXT);
+  drawCardRow1(CARD_Y[0], "今日请求数", "每 60 秒刷新");
+
+  formatCount(buf, sizeof(buf), data.tokenTotal);
+  drawCardBase(CARD_Y[1]);
+  drawCardValue(CARD_Y[1], buf, COL_TEXT);
+  drawCardRow1(CARD_Y[1], "今日 Tokens", "缓存+输入+输出");
+
+  drawDsBalanceCard(CARD_Y[2], data);
+  drawPageDots(page, pageCount);
+  drawStatusBar(ip);
+}
+
+void usageDisplayDrawEmpty(const char* ip) {
+  spr.fillScreen(COL_BG);
+  drawHeader("用量监控", COL_TEXT2, "未配置服务商", COL_TEXT2);
+  drawGradCard(76, 104, 0x220D, 0x0883);
+  spr.setFont(u8g2_font_wqy16_t_gb2312b);
+  spr.setTextColor(COL_TEXT);
+  spr.setCursor(UI_M + 16, 106);
+  spr.print("还没有凭据");
+  spr.setFont(u8g2_font_wqy12_t_gb2312b);
+  spr.setTextColor(COL_TEXT2);
+  spr.setCursor(UI_M + 16, 134);
+  spr.print("编辑 data/config.json");
+  spr.setCursor(UI_M + 16, 156);
+  spr.print("再执行 uploadfs");
+  drawPageDots(0, 1);
   drawStatusBar(ip);
 }

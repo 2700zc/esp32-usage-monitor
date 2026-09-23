@@ -1,3 +1,39 @@
+// ESP32 用量监视器 —— 配置文件
+//
+// 改完本文件后必须重新烧写文件系统才会生效（注意别和固件上传写在一条命令里，
+// 两者同时指定时文件系统上传会顶掉固件上传且不报错）：
+//     pio run -e esp32-usage-monitor -t uploadfs --upload-port COM5
+//
+// 任意一项留空 = 不显示该服务商的页面（页面总数自动减少，滑动切页照常可用）。
+// 留空只影响界面显示，不影响其他服务商。
+//
+// 注：本文件是带 // 注释的 JSON。设备端靠 -DARDUINOJSON_ENABLE_COMMENTS=1
+// （见 platformio.ini）才认这些注释，删掉那个编译选项会导致整个配置读取失败。
 {
-  "ds_token": "YOUR_DEEPSEEK_BEARER_TOKEN"
+  // ────────────── DeepSeek ──────────────
+  // 平台 Bearer token，不含 "Bearer " 前缀（不要带前缀，否则会 401）。
+  // 获取：登录 platform.deepseek.com/usage
+  //   → F12 → 网络 → 刷新 → 点任意 api/v0/ 开头的请求
+  //   → 请求头 authorization 里 "Bearer " 后面的部分
+  // 注意：这是网页登录态 token，有有效期，过期后该页显示"未配置 token"或获取失败。
+  "ds_token": "你的 DeepSeek Bearer token",
+
+  // ────────────── OpenCode Go ──────────────
+  // 下面三项必须【同时】填齐才会显示该页；任意一项为空则整页隐藏。
+  //   oc_workspace_id : workspace 地址里的 wrk_XXXXXXXX
+  //                     （https://opencode.ai/workspace/wrk_XXX/go）
+  //   oc_server_id    : _server?id=... 请求里那串 64 位十六进制
+  //   oc_cookie       : 请求头 cookie 的完整值，很长，形如
+  //                     "oc_locale=zh; auth=Fe26.2**..."
+  // cookie 有有效期，过期后该页会显示"cookie 已过期"，需重新复制并重刷文件系统。
+  "oc_workspace_id": "",
+  "oc_server_id": "",
+  "oc_cookie": "",
+
+  // ────────────── CommandCode ──────────────
+  // 只填 cookie 的【值】，不要带 cookie 名。
+  // 获取：登录 commandcode.ai → F12 → 应用(Application) → Cookie
+  //   → 找到 __Secure-commandcode_prod_.session_token，复制它的值
+  // 浏览器复制出来的值是 URL 编码的（含 %2F、%3D），原样填入即可。
+  "cc_cookie": "你的 CommandCode 会话 token"
 }
