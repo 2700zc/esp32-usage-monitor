@@ -1,6 +1,8 @@
 .pio/
 .vscode/
+.zcode/
 *.bin
 *.elf
 *.map
+compile_commands.json
 data/config.json
