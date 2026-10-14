@@ -1,6 +1,7 @@
 #define spr (*hwCanvas())
 
 #include "config.h"
+#include "agent_client.h"
 #include "deepseek_client.h"
 #include "opencode_client.h"
 #include "commandcode_client.h"
@@ -10,6 +11,7 @@
 #include "hw/gesture.h"
 #include "wifi_config.h"
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <time.h>
 #include <U8g2lib.h>
 
@@ -22,21 +24,35 @@ static const uint16_t MAIN_YELLOW = 0xFFE0;
 static const uint32_t REFRESH_ROUND_MS   = 60000;
 static const uint32_t CONNECT_TIMEOUT_MS = 10000;  // 自动连接 10 秒超时
 
+// ZCode 状态页的节奏与上面那轮无关：用量一分钟一变，状态一秒一变。局域网里的
+// 小请求只要几十毫秒，1 秒一次不会影响滑动和重绘。
+static const uint32_t AGENT_POLL_MS     = 1000;
+static const uint32_t AGENT_POLL_MAX_MS = 30000;  // 桥接不在时最长退避到这个间隔
+// 桥接在状态变化时直接推到这个端口（要跟 bridge.py 的 --udp-port 一致）
+static const uint16_t AGENT_UDP_PORT    = 8788;
+
 static AppConfig        s_cfg;
 static OpenCodeUsage    s_oc;
 static CommandCodeUsage s_cc;
 static DeepSeekUsage    s_ds;
+static AgentStatus      s_agent;
 
-// 页面顺序与 TokenHub 一致：OpenCode Go → CommandCode → DeepSeek。
-// 没配齐凭据的服务商不生成页面（只配了 DeepSeek 就仍是单页，滑动无效果）。
-enum class Prov : uint8_t { Oc, Cc, Ds };
-static Prov s_pages[3];
+// 页面顺序：ZCode 状态在最前，其余三家与 TokenHub 一致（OpenCode Go →
+// CommandCode → DeepSeek）。没配齐凭据的服务商不生成页面（只配了 DeepSeek
+// 就仍是单页，滑动无效果）。
+enum class Prov : uint8_t { Agent, Oc, Cc, Ds };
+static Prov s_pages[4];
 static int  s_pageCount = 0;
 static int  s_page      = 0;
 
 static uint32_t s_lastRound     = 0;  // 上一轮刷新开始时刻；0 = 尚未刷过
 static bool     s_refreshActive = false;
 static int      s_refreshIdx    = 0;
+
+static WiFiUDP  s_agentUdp;
+static bool     s_agentUdpReady = false;
+static uint32_t s_lastAgentPoll = 0;  // 0 = 尚未轮询过（连上 WiFi 后立刻取一次）
+static uint8_t  s_agentFailStreak = 0;
 
 static uint32_t s_wifiConnStart = 0;  // 自动连接开始时刻；0 = 未在自动连接
 static bool     s_wifiConnected = false;
@@ -45,10 +61,23 @@ static bool     s_inWifiConfig  = false;
 
 static void buildPages(const AppConfig& c) {
   s_pageCount = 0;
+  // 状态页放第一页：它是唯一"此刻正在发生"的一页，开机默认停在它上面才有意义
+  // （另外三页都是用量汇总，早一分钟晚一分钟看到没区别）。
+  if (cfgAgentReady(c)) s_pages[s_pageCount++] = Prov::Agent;
   if (cfgOcReady(c)) s_pages[s_pageCount++] = Prov::Oc;
   if (cfgCcReady(c)) s_pages[s_pageCount++] = Prov::Cc;
   if (cfgDsReady(c)) s_pages[s_pageCount++] = Prov::Ds;
   if (s_page >= s_pageCount) s_page = 0;
+}
+
+// 绑定 UDP 端口接收桥接的即时推送。重连后要重绑——接口状态变了，旧 socket
+// 不再收包。桥接没配时完全不绑，省一个常驻 socket。
+static void startAgentUdp() {
+  s_agentUdpReady = false;
+  if (!cfgAgentReady(s_cfg)) return;
+  s_agentUdpReady = s_agentUdp.begin(AGENT_UDP_PORT) == 1;
+  Serial.printf("agent: udp %s on %u\n", s_agentUdpReady ? "listening" : "bind failed",
+                (unsigned)AGENT_UDP_PORT);
 }
 
 static void startNtp() {
@@ -57,9 +86,12 @@ static void startNtp() {
 
 static void fetchOne(Prov p) {
   switch (p) {
-    case Prov::Oc: ocFetch(s_oc, s_cfg.oc_workspace_id, s_cfg.oc_cookie, s_cfg.oc_server_id); break;
+    case Prov::Oc: ocFetch(s_oc, s_cfg.oc_workspace_id, s_cfg.oc_cookie, s_cfg.oc_api_key); break;
     case Prov::Cc: ccFetch(s_cc, s_cfg.cc_cookie); break;
     case Prov::Ds: dsFetchToday(s_ds, s_cfg.ds_token); break;
+    // 状态页不进 60 秒轮次：它按秒更新（见 loop 里的轮询块），塞进轮次里只会
+    // 让状态最多滞后一分钟。
+    case Prov::Agent: break;
   }
 }
 
@@ -71,6 +103,7 @@ static void drawCurrentPage(const char* ip, const char* netStatus) {
     return;
   }
   switch (s_pages[s_page]) {
+    case Prov::Agent: usageDisplayDrawAgent(s_agent, ip, s_page, s_pageCount, netStatus); break;
     case Prov::Oc: usageDisplayDrawOc(s_oc, ip, s_page, s_pageCount, netStatus); break;
     case Prov::Cc: usageDisplayDrawCc(s_cc, ip, s_page, s_pageCount, netStatus); break;
     case Prov::Ds: usageDisplayDrawDs(s_ds, ip, s_page, s_pageCount, netStatus); break;
@@ -81,6 +114,7 @@ static void drawCurrentPage(const char* ip, const char* netStatus) {
 static bool currentPageHasData() {
   if (s_pageCount == 0) return false;
   switch (s_pages[s_page]) {
+    case Prov::Agent: return s_agent.valid;
     case Prov::Oc: return s_oc.valid;
     case Prov::Cc: return s_cc.valid;
     case Prov::Ds: return s_ds.valid;
@@ -106,9 +140,9 @@ void setup() {
 
   loadConfig(s_cfg);
   buildPages(s_cfg);
-  Serial.printf("boot: %d page(s) ready (oc=%d cc=%d ds=%d)\n",
-                s_pageCount, (int)cfgOcReady(s_cfg), (int)cfgCcReady(s_cfg),
-                (int)cfgDsReady(s_cfg));
+  Serial.printf("boot: %d page(s) ready (agent=%d oc=%d cc=%d ds=%d)\n",
+                s_pageCount, (int)cfgAgentReady(s_cfg), (int)cfgOcReady(s_cfg),
+                (int)cfgCcReady(s_cfg), (int)cfgDsReady(s_cfg));
 
   // 优先自动连接上次保存的 WiFi；没有凭据则直接进配置界面
   char savedSSID[33], savedPass[65];
@@ -130,6 +164,8 @@ void loop() {
       s_wifiConnected = true;
       s_wifiConnStart = 0;
       startNtp();
+      startAgentUdp();
+      s_lastAgentPoll = 0;       // 连上就立刻取一次状态
       requestRefresh();          // 连上就立刻刷一轮
     } else if (s_wifiConnStart != 0 && !s_inWifiConfig &&
                millis() - s_wifiConnStart >= CONNECT_TIMEOUT_MS) {
@@ -180,6 +216,44 @@ void loop() {
     }
   }
 
+  // ── ZCode 状态：独立节奏，不参与上面那轮 60 秒刷新 ──
+  // 桥接不在时（PC 关机、IP 变了、防火墙拦了）每次失败都要等满连接超时，
+  // 所以失败后逐步退避到 30 秒一次：宁可状态旧一点，也不能让每秒一次的
+  // 1.2 秒阻塞把滑动和重绘卡死。
+  if (s_wifiConnected && !s_inWifiConfig && cfgAgentReady(s_cfg)) {
+    uint32_t backoff  = AGENT_POLL_MS << s_agentFailStreak;
+    uint32_t interval = backoff > AGENT_POLL_MAX_MS ? AGENT_POLL_MAX_MS : backoff;
+    if (s_lastAgentPoll == 0 || now - s_lastAgentPoll >= interval) {
+      s_lastAgentPoll = now;
+      if (agFetch(s_agent, s_cfg.agent_url)) {
+        s_agentFailStreak = 0;
+      } else if (s_agentFailStreak < 6) {
+        s_agentFailStreak++;
+      }
+    }
+    // 桥接在状态变化时直接推一份过来，比轮询快得多。parsePacket 不阻塞，
+    // 没有包时立刻返回 0。只在状态真的变了时打日志——一次状态变化一行，
+    // 既能确认这条最快的链路通不通，也不会变成每秒刷屏。
+    if (s_agentUdpReady) {
+      int n = s_agentUdp.parsePacket();
+      if (n > 0) {
+        char buf[384];
+        int len = s_agentUdp.read(buf, sizeof(buf) - 1);
+        if (len > 0) {
+          buf[len] = 0;
+          if (agApply(s_agent, buf, true)) {
+            s_agentFailStreak = 0;
+            // 打的是卡片上真正显示的内容（第三张卡片：执行中显示动作，其余显示
+            // 项目名），所以在终端里也能"看屏"，不用凑到板子跟前。
+            if (s_agent.tool[0]) Serial.printf("agent: push %s %s", s_agent.state, s_agent.tool);
+            else                 Serial.printf("agent: push %s", s_agent.state);
+            Serial.printf(" | %s\n", s_agent.action[0] ? s_agent.action : s_agent.project);
+          }
+        }
+      }
+    }
+  }
+
   // ── 分批刷新：每帧最多抓一个服务商 ──
   if (s_wifiConnected && !s_inWifiConfig) {
     if (!s_refreshActive && (s_lastRound == 0 || now - s_lastRound >= REFRESH_ROUND_MS)) {
@@ -204,6 +278,8 @@ void loop() {
     if (s_wfCfg.state == WfState::Connected) {
       s_wifiConnected = true;
       startNtp();
+      startAgentUdp();
+      s_lastAgentPoll = 0;
       requestRefresh();
       s_inWifiConfig = false;
     } else if (done) {

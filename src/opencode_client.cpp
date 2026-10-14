@@ -1,175 +1,183 @@
 #include "opencode_client.h"
 #include "http_client.h"
-#include <stdlib.h>
+#include "json_util.h"
+#include <ArduinoJson.h>
 #include <string.h>
 
 static const char* OC_HOST = "opencode.ai";
+static const char* OC_SESSION_COOKIE = "__Host-console_session";
 
-// ── URL 编码 ──
-// 与 Python urllib.parse.quote 的默认 safe='/' 一致：unreserved 字符与 '/' 原样保留，
-// 其余全部转 %XX。args 是 JSON，花括号引号冒号都会被编码。
-static bool encAppend(char* dst, size_t dstSz, size_t& pos, const char* src) {
-  // 名字不能叫 HEX——Arduino 的 Print.h 里 #define HEX 16
-  static const char* hexDigits = "0123456789ABCDEF";
-  for (const unsigned char* p = (const unsigned char*)src; *p; p++) {
-    unsigned char c = *p;
-    bool keep = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' ||
-                c == '~' || c == '/';
-    if (keep) {
-      if (pos + 2 > dstSz) return false;
-      dst[pos++] = (char)c;
-    } else {
-      if (pos + 4 > dstSz) return false;
-      dst[pos++] = '%';
-      dst[pos++] = hexDigits[c >> 4];
-      dst[pos++] = hexDigits[c & 0x0F];
-    }
-  }
-  dst[pos] = 0;
+// session 值的形状：st_ 开头，后面全是十六进制与 '-'（实测 39 字符）。Python 版
+// 认裸值时用的也是这条（st_[0-9a-f-]{20,}）。
+// 校验的意义在于"粘贴被截断"这类情况：只取到半截 token 的话请求必是 401，
+// 界面会说"cookie 已过期"，把人往错的方向引；先判形状就能报"缺少 session"。
+static bool isSessionChar(char c) {
+  return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+         (c >= 'A' && c <= 'F') || c == '-';
+}
+
+static bool looksLikeSession(const char* s, size_t n) {
+  if (n < 23 || strncmp(s, "st_", 3) != 0) return false;
+  for (size_t i = 3; i < n; i++)
+    if (!isSessionChar(s[i])) return false;
   return true;
 }
 
-// 返回与 openIdx 处 '{' 配对的 '}' 下标；字符串字面量里的花括号会被跳过
-static int matchBrace(const String& s, int openIdx) {
-  int depth = 0;
-  int n = (int)s.length();
-  for (int i = openIdx; i < n; i++) {
-    char c = s[i];
-    if (c == '"') {
-      i++;
-      while (i < n && s[i] != '"') {
-        if (s[i] == '\\') i++;
-        i++;
-      }
-      continue;
+// 从填进来的凭据里取出 __Host-console_session 的值，三种写法都认（与 TokenHub
+// 的 extract_console_session 一致）：
+//   1. 裸值           st_6d1759dd-3b3f-4c79-b109-40163b463cf3
+//   2. 整串 cookie    oc_locale=zh; __Host-console_session=st_…; __stripe_mid=…
+//   3. 整条 curl      （cookie 名可能跨行，靠名字定位即可）
+// 旧版的 auth=Fe26.2**（_server 接口那套）不在识别范围内：那个接口 2026-10 起
+// 只回 302 跳登录页，凭据换成 console 会话才有用量。
+static bool extractSession(const char* raw, char* out, size_t sz) {
+  if (!raw || !raw[0] || sz < 48) return false;
+
+  const char* p = strstr(raw, OC_SESSION_COOKIE);
+  if (p) {
+    p += strlen(OC_SESSION_COOKIE);
+    // 值前面可能隔着 =、"、' 与换行（整条 curl 被续行拆开时下一行以引号开头）
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' ||
+           *p == '=' || *p == '"' || *p == '\'' || *p == '\\') p++;
+    size_t n = 0;
+    while (p[n] && n < sz - 1 && p[n] != ';' && p[n] != '"' && p[n] != '\'' &&
+           p[n] != ' ' && p[n] != '\t' && p[n] != '\r' && p[n] != '\n') {
+      n++;
     }
-    if (c == '{') {
-      depth++;
-    } else if (c == '}') {
-      if (--depth == 0) return i;
+    // 顶到缓冲区上限说明值被截断了；形状不对则多半是粘贴被拆断，都交给下面的
+    // 裸值扫描再试一次，最终由调用方报"缺少 session"
+    if (n > 0 && !(n == sz - 1 && p[n]) && looksLikeSession(p, n)) {
+      memcpy(out, p, n);
+      out[n] = 0;
+      return true;
     }
   }
-  return -1;
+
+  // 裸值：st_ 后面跟一串十六进制与 '-'（与 Python 的 st_[0-9a-f-]{20,} 同规则）。
+  // 太短的多半是别的字符串里巧合出现的 "st_"
+  for (const char* q = raw; (q = strstr(q, "st_")) != nullptr; q += 3) {
+    size_t n = 0;
+    while (n < 64 && isSessionChar(q[3 + n])) n++;
+    if (n >= 20 && n + 4 <= sz) {
+      memcpy(out, q, n + 3);
+      out[n + 3] = 0;
+      return true;
+    }
+  }
+  return false;
 }
 
-// 读一个用量窗口。响应不是 JSON，是 SolidStart 的服务端函数文本：
-//   rollingUsage:$R[2]={status:"ok",resetInSec:18000,usagePercent:0,usage:0,limit:1200000000}
-// 所以先定位 key，再取其后那个对象的花括号范围，然后在范围内找三个字段——
-// 不依赖字段顺序，也不依赖 $R[n] 的下标。
-static bool scanSegment(const String& body, const char* key, UsageSegment& seg) {
-  int k = body.indexOf(key);
-  if (k < 0) return false;
-  int ob = body.indexOf('{', k);
-  if (ob < 0) return false;
-  int cb = matchBrace(body, ob);
-  if (cb < 0) return false;
-
-  int sp = body.indexOf("status:\"", ob);
-  if (sp >= 0 && sp < cb) {
-    int v0 = sp + 8;
-    int v1 = body.indexOf('"', v0);
-    if (v1 > v0 && v1 <= cb) {
-      int n = v1 - v0;
-      if (n > (int)sizeof(seg.status) - 1) n = (int)sizeof(seg.status) - 1;
-      memcpy(seg.status, body.c_str() + v0, n);
-      seg.status[n] = 0;
-    }
+// 一个用量窗口。上游实测响应（2026-10，883 字节）：
+//   {"access":{"meters":{
+//      "fiveHour":{"startsAt":"…","resetsAt":"2026-10-09T05:37:30.000Z",
+//                  "limitMicroCents":"1200000000","usedMicroCents":"6510335"},
+//      "week":{…},"month":{…}}}}
+// 缺字段或上限为 0 按 unavailable 处理（界面显示 -- 与「额度不可用」），与 TokenHub
+// 的 parse_go_status 一致；month 的 startsAt 实测就是缺的，别依赖它。
+static void parseMeter(JsonObject m, UsageSegment& seg) {
+  if (m.isNull()) {
+    strlcpy(seg.status, "unavailable", sizeof(seg.status));
+    return;
   }
-
-  int rp = body.indexOf("resetInSec:", ob);
-  if (rp >= 0 && rp < cb)
-    seg.resetSec = (uint32_t)strtoul(body.c_str() + rp + 11, nullptr, 10);
-
-  int pp = body.indexOf("usagePercent:", ob);
-  if (pp >= 0 && pp < cb) {
-    seg.percent = (float)strtod(body.c_str() + pp + 13, nullptr);
-    seg.valid = true;
+  double cap  = jnum(m["limitMicroCents"]);
+  double used = jnum(m["usedMicroCents"]);
+  if (cap <= 0) {
+    strlcpy(seg.status, "unavailable", sizeof(seg.status));
+    return;
   }
-  return seg.valid;
+  seg.valid    = true;
+  seg.percent  = (float)(used / cap * 100.0);
+  seg.resetSec = resetSecFromIso(m["resetsAt"] | "");
+  strlcpy(seg.status, "ok", sizeof(seg.status));
 }
 
-bool ocFetch(OpenCodeUsage& out, const char* workspaceId, const char* cookie, const char* serverId) {
+bool ocFetch(OpenCodeUsage& out, const char* workspaceId, const char* cookie, const char* apiKey) {
   // 失败时不清 valid：保留上一次成功的数据供界面继续显示（见 dsFetchToday 的说明）
   out.lastError = ocErrOk;
   out.lastHttp = 0;
   out.lastDetail[0] = 0;
 
-  if (!workspaceId || !workspaceId[0] || !cookie || !cookie[0] || !serverId || !serverId[0]) {
-    out.lastError = ocErrNoToken;
-    Serial.println("oc: workspace_id / server_id / cookie 不全");
-    return false;
-  }
+  // API key 优先：它是长期凭据，而 console 会话 cookie 会过期。实测（2026-10-09）
+  // Bearer 方式连 x-org-id 与 Referer 都不需要，所以这条路径不依赖 workspace_id。
+  const bool useKey = apiKey && apiKey[0];
 
-  // args 是 JSON，整体 URL 编码后作为查询参数
-  char argsJson[192];
-  int n = snprintf(argsJson, sizeof(argsJson),
-                   "{\"t\":{\"t\":9,\"i\":0,\"l\":1,\"a\":[{\"t\":1,\"s\":\"%s\"}],\"o\":0},"
-                   "\"f\":31,\"m\":[]}", workspaceId);
-  if (n < 0 || n >= (int)sizeof(argsJson)) {
-    out.lastError = ocErrParse;
-    strlcpy(out.lastDetail, "workspace_id 过长", sizeof(out.lastDetail));
-    return false;
-  }
-
-  char path[768];
-  int head = snprintf(path, sizeof(path), "/_server?id=%s&args=", serverId);
-  if (head < 0 || head >= (int)sizeof(path)) {
-    out.lastError = ocErrParse;
-    strlcpy(out.lastDetail, "server_id 过长", sizeof(out.lastDetail));
-    return false;
-  }
-  size_t pos = (size_t)head;
-  if (!encAppend(path, sizeof(path), pos, argsJson)) {
-    out.lastError = ocErrParse;
-    strlcpy(out.lastDetail, "url 过长", sizeof(out.lastDetail));
-    return false;
-  }
-
+  char auth[96];
+  char session[128];
   char referer[128];
-  snprintf(referer, sizeof(referer), "https://opencode.ai/workspace/%s/go", workspaceId);
+  char cookieHdr[160];
+  HttpHeader hKey[3];
+  HttpHeader hCookie[5];
 
-  HttpHeader h[] = {
-    {"User-Agent",        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-    {"X-Server-Id",       serverId},
-    {"X-Server-Instance", "server-fn:0"},
-    {"Referer",           referer},
-    {"Cookie",            cookie},
-  };
+  if (useKey) {
+    snprintf(auth, sizeof(auth), "Bearer %s", apiKey);
+    hKey[0] = {"User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"};
+    hKey[1] = {"Accept", "*/*"};
+    hKey[2] = {"Authorization", auth};
+  } else {
+    if (!workspaceId || !workspaceId[0] || !cookie || !cookie[0]) {
+      out.lastError = ocErrNoToken;
+      Serial.println("oc: 既没配 api key，workspace_id / cookie 也不全");
+      return false;
+    }
+    if (!extractSession(cookie, session, sizeof(session))) {
+      out.lastError = ocErrNoSession;
+      // 卡片里这一行只有约 160px，wqy12 下 22 个 ASCII 加 1 个汉字刚好放得下
+      strlcpy(out.lastDetail, "需 __Host-console_session", sizeof(out.lastDetail));
+      Serial.println("oc: cookie 里没找到 __Host-console_session（旧版 auth= 已失效）");
+      return false;
+    }
+    snprintf(referer, sizeof(referer), "https://opencode.ai/console/%s/models", workspaceId);
+    snprintf(cookieHdr, sizeof(cookieHdr), "%s=%s", OC_SESSION_COOKIE, session);
+    hCookie[0] = {"User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"};
+    hCookie[1] = {"Accept", "*/*"};
+    hCookie[2] = {"x-org-id", workspaceId};
+    hCookie[3] = {"Referer", referer};
+    hCookie[4] = {"Cookie", cookieHdr};
+  }
+
+  const HttpHeader* h = useKey ? hKey : hCookie;
+  const size_t nH = useKey ? 3 : 5;
 
   String body;
-  int st = httpGetSecure("oc", OC_HOST, path, h, sizeof(h) / sizeof(h[0]), body);
+  int st = httpGetSecure("oc", OC_HOST, "/console/api/go/status", h, nH, body);
   if (st == 0) { out.lastError = ocErrNetwork; return false; }
-  if (st == 302 || st == 401 || st == 403) {
+  // 会话过期时是 401；未登录访问则可能给一个跳登录页的 302
+  if (st == 401 || st == 403 || st == 302) {
     out.lastError = ocErrAuth;
     out.lastHttp = st;
+    strlcpy(out.lastDetail, useKey ? "换新 key 后重刷文件系统" : "重新复制后重刷文件系统",
+            sizeof(out.lastDetail));
     return false;
   }
   if (st != 200) { out.lastError = ocErrHttp; out.lastHttp = st; return false; }
 
-  OpenCodeUsage tmp = {};
-  int found = 0;
-  if (scanSegment(body, "rollingUsage:", tmp.rolling)) found++;
-  if (scanSegment(body, "weeklyUsage:",  tmp.weekly))  found++;
-  if (scanSegment(body, "monthlyUsage:", tmp.monthly)) found++;
-
-  if (found == 0) {
-    // cookie 失效时是 HTTP 200 + 一个跳登录页的 302 Response 描述，不是 401
-    if (body.indexOf("console/login") >= 0) {
-      out.lastError = ocErrAuth;
-      Serial.println("oc: cookie 已过期（正文为登录跳转）");
-    } else {
-      out.lastError = ocErrParse;
-      strlcpy(out.lastDetail, "未找到用量字段", sizeof(out.lastDetail));
-      Serial.printf("oc: 解析失败，正文 %d 字节\n", body.length());
-    }
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, body);
+  if (err != DeserializationError::Ok) {
+    out.lastError = ocErrParse;
+    snprintf(out.lastDetail, sizeof(out.lastDetail), "json:%s", err.c_str());
+    Serial.printf("oc: json error: %s\n", err.c_str());
     return false;
   }
+
+  JsonObject meters = doc["access"]["meters"];
+  if (meters.isNull()) {
+    out.lastError = ocErrParse;
+    strlcpy(out.lastDetail, "缺 access.meters", sizeof(out.lastDetail));
+    Serial.println("oc: 响应里没有 access.meters（套餐不是 Go？）");
+    return false;
+  }
+
+  OpenCodeUsage tmp = {};
+  parseMeter(meters["fiveHour"], tmp.rolling);
+  parseMeter(meters["week"],     tmp.weekly);
+  parseMeter(meters["month"],    tmp.monthly);
 
   tmp.valid = true;
   tmp.fetchedAt = millis();
   out = tmp;
-  Serial.printf("oc: rolling=%.1f%% weekly=%.1f%% monthly=%.1f%%\n",
+  Serial.printf("oc[%s]: rolling=%.2f%% weekly=%.2f%% monthly=%.2f%%\n",
+                useKey ? "key" : "cookie",
                 tmp.rolling.percent, tmp.weekly.percent, tmp.monthly.percent);
   return true;
 }

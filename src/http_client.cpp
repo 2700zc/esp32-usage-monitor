@@ -1,4 +1,5 @@
 #include "http_client.h"
+#include <WiFiClient.h>
 #include <WiFiClientSecure.h>
 
 // 正文上限 64 KB。三个服务商的响应通常都在 20 KB 以内。
@@ -14,20 +15,12 @@
 // 原地解析（传指针+长度，不做 substring 拷贝）比单纯调大上限更稳。
 static const size_t HTTP_MAX_BODY = 65536;
 
-int httpGetSecure(const char* tag, const char* host, const char* path,
-                  const HttpHeader* headers, size_t nHeaders,
-                  String& body, uint32_t timeoutMs) {
-  body = "";
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(timeoutMs);
-
-  if (!client.connect(host, 443, timeoutMs)) {
-    Serial.printf("%s: connect %s failed\n", tag, host);
-    return 0;
-  }
-
+// 建连之外的全部逻辑。TLS 与明文只差建连那几行，读写与解析共用这一份——
+// 下面这段按 Content-Length 精确读取的循环有几个反复踩过的坑，复制一份出来
+// 迟早会漂移。
+static int httpGetOn(Client& client, const char* tag, const char* host, const char* path,
+                     const HttpHeader* headers, size_t nHeaders,
+                     String& body, uint32_t timeoutMs) {
   client.print("GET ");
   client.print(path);
   client.println(" HTTP/1.1");
@@ -92,4 +85,35 @@ int httpGetSecure(const char* tag, const char* host, const char* path,
   Serial.printf("%s: %s -> HTTP %d, %d bytes (cl=%d)\n", tag, pathLog, status,
                 body.length(), contentLength);
   return status;
+}
+
+int httpGetSecure(const char* tag, const char* host, const char* path,
+                  const HttpHeader* headers, size_t nHeaders,
+                  String& body, uint32_t timeoutMs) {
+  body = "";
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(timeoutMs);
+
+  if (!client.connect(host, 443, timeoutMs)) {
+    Serial.printf("%s: connect %s failed\n", tag, host);
+    return 0;
+  }
+  return httpGetOn(client, tag, host, path, headers, nHeaders, body, timeoutMs);
+}
+
+int httpGetPlain(const char* tag, const char* host, uint16_t port, const char* path,
+                 const HttpHeader* headers, size_t nHeaders,
+                 String& body, uint32_t timeoutMs) {
+  body = "";
+
+  WiFiClient client;
+  client.setTimeout(timeoutMs);
+
+  if (!client.connect(host, port, timeoutMs)) {
+    Serial.printf("%s: connect %s:%u failed\n", tag, host, (unsigned)port);
+    return 0;
+  }
+  return httpGetOn(client, tag, host, path, headers, nHeaders, body, timeoutMs);
 }

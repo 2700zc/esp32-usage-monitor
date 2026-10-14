@@ -1,50 +1,12 @@
 #include "commandcode_client.h"
 #include "http_client.h"
+#include "json_util.h"
 #include <ArduinoJson.h>
-#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
 static const char* CC_HOST = "api.commandcode.ai";
 static const char* CC_TOKEN_COOKIE = "__Secure-commandcode_prod_.session_token";
-
-// used / cap / monthlyCredits 实测是 JSON 数字，但字段名带 Credits 的几项
-// 上游有返回字符串的先例，两种都吃。
-static double jnum(JsonVariant v) {
-  if (v.isNull()) return 0;
-  if (v.is<const char*>()) {
-    const char* s = v.as<const char*>();
-    return s ? strtod(s, nullptr) : 0;
-  }
-  return v.as<double>();
-}
-
-// days-from-civil（Howard Hinnant）。不依赖 newlib 的 timegm——它在部分
-// ESP32 工具链里没导出。
-static int64_t daysFromCivil(int y, int m, int d) {
-  y -= (m <= 2);
-  int64_t era = (y >= 0 ? y : y - 399) / 400;
-  unsigned yoe = (unsigned)(y - era * 400);
-  unsigned doy = (unsigned)((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1);
-  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-  return era * 146097 + (int64_t)doe - 719468;
-}
-
-// 解析 "2026-10-07T13:43:17.000Z"（UTC，毫秒部分忽略）
-static bool parseIsoUtc(const char* s, time_t& out) {
-  int y, mo, d, h, mi, se;
-  if (!s || sscanf(s, "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &se) != 6) return false;
-  out = (time_t)(daysFromCivil(y, mo, d) * 86400 + h * 3600 + mi * 60 + se);
-  return true;
-}
-
-// resetAt 是 epoch 毫秒。NTP 未同步时返回 0，界面显示 "--"。
-static uint32_t resetSecFromMs(double resetAtMs) {
-  time_t now = time(nullptr);
-  if (now < 100000 || resetAtMs <= 0) return 0;
-  double diff = resetAtMs / 1000.0 - (double)now;
-  return diff > 0 ? (uint32_t)diff : 0;
-}
 
 static void makeSeg(UsageSegment& seg, double used, double cap, double resetAtMs) {
   if (cap <= 0) {
@@ -137,13 +99,8 @@ bool ccFetch(CommandCodeUsage& out, const char* token) {
   st = httpGetSecure("cc", CC_HOST, "/internal/billing/subscriptions", h, nH, body);
   if (st == 200) {
     JsonDocument doc;
-    if (deserializeJson(doc, body) == DeserializationError::Ok) {
-      const char* endIso = doc["data"]["currentPeriodEnd"] | "";
-      time_t endTs;
-      time_t now = time(nullptr);
-      if (parseIsoUtc(endIso, endTs) && now >= 100000 && endTs > now)
-        tmp.monthly.resetSec = (uint32_t)(endTs - now);
-    }
+    if (deserializeJson(doc, body) == DeserializationError::Ok)
+      tmp.monthly.resetSec = resetSecFromIso(doc["data"]["currentPeriodEnd"] | "");
   } else {
     Serial.printf("cc: subscriptions http=%d，月度倒计时保持 --\n", st);
   }

@@ -21,6 +21,8 @@ static const uint16_t COL_DOT_OFF = 0x52AA;  // #555555 未选中的页码点
 // TokenHub 里三个服务商的强调色，转 RGB565
 static const uint16_t COL_OC      = 0x1BBA;  // #1976d2 OpenCode Go
 static const uint16_t COL_CC      = 0x044F;  // #00897b CommandCode
+static const uint16_t COL_AGENT   = 0x8AFE;  // #8B5CF6 ZCode 状态页
+static const uint16_t COL_GREEN   = 0x2E6E;  // #2ECC71 思考完成
 
 // 画布 184×224（2× 放大到物理 480×480）；边距 4 = 物理 8px，卡片几乎铺满
 static const int UI_M  = 4;
@@ -267,6 +269,20 @@ static void drawCardValue(int y, const char* value, uint16_t color) {
   spr.setTextSize(1);
 }
 
+// 百分比文案，与 TokenHub 的 _fmt_cc_pct 一致：最多两位小数、去掉尾随的 0
+// （0.54% / 3.01% / 25%），到 100% 封顶。
+// OpenCode 的额度由微元计价换算而来，小数位很碎，只留一位会把 0.54% 和 0.56%
+// 显示成同一个值。
+static void fmtPercent(char* buf, size_t sz, float pct) {
+  if (pct >= 100.0f) { strlcpy(buf, "100%", sz); return; }
+  char num[16];
+  snprintf(num, sizeof(num), "%.2f", (double)pct);
+  size_t n = strlen(num);
+  while (n > 0 && num[n - 1] == '0') num[--n] = 0;  // 3.00 -> "3."
+  if (n > 0 && num[n - 1] == '.')    num[--n] = 0;  // "3." -> "3"
+  snprintf(buf, sz, "%s%%", num);
+}
+
 // 用量百分比卡片。无上限 / 无额度时数值显示 --，原因写在标签行右侧。
 static void drawUsageCard(int y, const char* label, const UsageSegment& seg, uint16_t accent) {
   drawCardBase(y);
@@ -282,15 +298,8 @@ static void drawUsageCard(int y, const char* label, const UsageSegment& seg, uin
   }
 
   char buf[24];
-  if (seg.valid) {
-    // 整数不带小数位，与 TokenHub 的 _fmt_cc_pct 一致
-    if (seg.percent >= 100.0f)                snprintf(buf, sizeof(buf), "100%%");
-    else if (seg.percent == (float)(int)seg.percent)
-                                              snprintf(buf, sizeof(buf), "%d%%", (int)seg.percent);
-    else                                      snprintf(buf, sizeof(buf), "%.1f%%", seg.percent);
-  } else {
-    strlcpy(buf, "--", sizeof(buf));
-  }
+  if (seg.valid) fmtPercent(buf, sizeof(buf), seg.percent);
+  else           strlcpy(buf, "--", sizeof(buf));
 
   // 达到 100% 用红色警示——TokenHub 无阈值配色，这里按小屏可读性补上
   drawCardValue(y, buf, seg.valid && seg.percent >= 100.0f ? COL_RED : accent);
@@ -309,8 +318,12 @@ void usageDisplayDrawOc(const OpenCodeUsage& data, const char* ip, int page, int
   switch (data.lastError) {
     case ocErrNoToken: reason = "未配置凭据"; break;
     case ocErrNetwork: reason = "网络连接失败"; break;
-    case ocErrAuth:    reason = "cookie 已过期";
-                       detail = "重新复制后重刷文件系统"; break;
+    // 具体是 key 被拒还是 cookie 过期，由客户端写进 lastDetail（两种凭据的补救方式不同）
+    case ocErrAuth:    reason = "凭据已失效";
+                       detail = data.lastDetail[0] ? data.lastDetail
+                                                   : "重新获取后重刷文件系统"; break;
+    case ocErrNoSession: reason = "cookie 缺少 session";
+                         detail = "重填含 session 的 cookie"; break;
     case ocErrHttp:    snprintf(httpTxt, sizeof(httpTxt), "HTTP %d", data.lastHttp);
                        reason = httpTxt; break;
     case ocErrParse:   reason = "数据解析失败"; break;
@@ -428,6 +441,133 @@ void usageDisplayDrawDs(const DeepSeekUsage& data, const char* ip, int page, int
   drawCardRow1(CARD_Y[1], "今日 Tokens", "缓存+输入+输出");
 
   drawDsBalanceCard(CARD_Y[2], data);
+  drawPageDots(page, pageCount);
+  drawStatusBar(ip);
+}
+
+// ── ZCode Agent 状态页 ──
+
+// 状态 -> 文案。桥接以后加了新状态（或字段缺失）就原样显示，不猜。
+static const char* agentStateLabel(const char* state, char* buf, size_t sz) {
+  if (strcmp(state, "thinking") == 0) return "正在思考";
+  if (strcmp(state, "tool") == 0)     return "执行工具";
+  if (strcmp(state, "waiting") == 0)  return "等待授权";
+  if (strcmp(state, "done") == 0)     return "思考完成";
+  if (strcmp(state, "idle") == 0)     return "空闲";
+  snprintf(buf, sz, "%s", state);
+  return buf;
+}
+
+// 配色与文案同源：等待授权用琥珀（要人管），完成用绿，思考用蓝
+static uint16_t agentStateColor(const char* state) {
+  if (strcmp(state, "thinking") == 0) return COL_BLUE;
+  if (strcmp(state, "tool") == 0)     return COL_CC;
+  if (strcmp(state, "waiting") == 0)  return COL_AMBER;
+  if (strcmp(state, "done") == 0)     return COL_GREEN;
+  return COL_TEXT2;  // 空闲
+}
+
+// 秒级新鲜度。formatAge 的"刚刚"覆盖 90 秒，在一个每秒更新的状态页上等于没有
+// 信息——这里 90 秒内按秒显示。
+static void formatAgeShort(char* buf, size_t sz, uint32_t sec) {
+  if (sec < 90)        snprintf(buf, sz, "%lu 秒前", (unsigned long)sec);
+  else if (sec < 3600) snprintf(buf, sz, "%lu 分钟前", (unsigned long)(sec / 60));
+  else                 snprintf(buf, sz, "%lu 小时前", (unsigned long)(sec / 3600));
+}
+
+// 按真实显示宽度裁剪（wqy 是定宽字体：ASCII 占半格、中文占一格），超长时末尾
+// 补省略号。桥接已经按字符数截过一次，但中文和 ASCII 的宽度差一倍，只有这里
+// 知道实际像素宽度——一个 26 字符的中文串比 26 字符的英文宽一倍，会直接画出卡片。
+static void fitText(char* dst, size_t dstSz, const char* src, int maxW) {
+  if (textWidth(src, 12, 1) <= maxW) {
+    strlcpy(dst, src, dstSz);
+    return;
+  }
+  const int ellW = textWidth("…", 12, 1);
+  size_t out = 0;
+  dst[0] = 0;
+  for (const unsigned char* p = (const unsigned char*)src; *p; ) {
+    int cl = (*p < 0x80) ? 1 : ((*p & 0xE0) == 0xC0) ? 2 : ((*p & 0xF0) == 0xE0) ? 3 : 4;
+    if (out + cl + 4 >= dstSz) break;
+    char probe[80];
+    memcpy(probe, dst, out);
+    memcpy(probe + out, p, cl);
+    probe[out + cl] = 0;
+    if (textWidth(probe, 12, 1) + ellW > maxW) break;
+    memcpy(dst + out, p, cl);
+    out += cl;
+    dst[out] = 0;
+    p += cl;
+  }
+  strlcpy(dst + out, "…", dstSz - out);
+}
+
+void usageDisplayDrawAgent(const AgentStatus& data, const char* ip, int page, int pageCount,
+                           const char* netStatus) {
+  spr.fillScreen(COL_BG);
+
+  char httpTxt[16] = "";
+  const char* reason = nullptr;
+  switch (data.lastError) {
+    case agErrNoUrl:   reason = "未配置桥接地址"; break;
+    case agErrBadUrl:  reason = "桥接地址格式不对"; break;
+    case agErrNetwork: reason = "连不上桥接"; break;
+    case agErrHttp:    snprintf(httpTxt, sizeof(httpTxt), "HTTP %d", data.lastHttp);
+                       reason = httpTxt; break;
+    case agErrParse:   reason = "数据解析失败"; break;
+    default:           break;     // agErrOk
+  }
+  if (netStatus) reason = netStatus;
+  // 桥接自己说这个状态可能过期了（会话进程中途没了、事件断了），按失败处理：
+  // 状态照常显示，页头换成琥珀色。与另外三页"失败不清 valid"一致。
+  if (!reason && data.valid && data.stale) reason = "状态可能已过期";
+
+  if (!data.valid) {
+    // 从没成功过：整页提示
+    drawHeader("ZCode", COL_AGENT, "Agent 状态", COL_TEXT2);
+    drawStatusBody(reason ? "获取失败" : "正在获取", reason ? COL_RED : COL_TEXT2,
+                   reason ? reason : "等待首次刷新", data.lastDetail, ip, page, pageCount);
+    return;
+  }
+
+  char sub[48], age[16];
+  formatAgeShort(age, sizeof(age), data.ageSec);
+  snprintf(sub, sizeof(sub), "Agent 状态 · %s", age);
+  drawHeaderStatus("ZCode", COL_AGENT, sub, reason, data.fetchedAt);
+
+  // 卡片 1：状态本体。会话数只在多于一个时出现（同时开两个窗口才有意义）
+  char label[16];
+  drawCardBase(CARD_Y[0]);
+  drawCardValue(CARD_Y[0], agentStateLabel(data.state, label, sizeof(label)),
+                agentStateColor(data.state));
+  char sessions[20];
+  sessions[0] = 0;
+  if (data.activeSessions > 1) snprintf(sessions, sizeof(sessions), "%u 个会话", data.activeSessions);
+  drawCardRow1(CARD_Y[0], "ZCode 状态", sessions);
+
+  // 卡片 2：正在执行的工具。右侧标出这一份是 UDP 推来的还是轮询取的——
+  // 两条链路出问题时这是最快的区分办法。
+  drawCardBase(CARD_Y[1]);
+  drawCardValue(CARD_Y[1], data.tool[0] ? data.tool : "--",
+                data.tool[0] ? COL_TEXT : COL_TEXT2);
+  drawCardRow1(CARD_Y[1], "当前工具", data.pushed ? "实时" : "轮询");
+
+  // 卡片 3：正在做什么。工具类事件带 action（Bash 的命令、Edit 的文件名），
+  // 其余状态退回显示会话所属的项目名——"已持续多久"看两眼就腻了，不如换成
+  // 一个能回答"它现在到底在干嘛"的字段。
+  const char* c3label = "当前项目";
+  const char* c3src   = data.project;
+  if ((strcmp(data.state, "tool") == 0 || strcmp(data.state, "waiting") == 0)
+      && data.action[0]) {
+    c3label = "当前动作";
+    c3src   = data.action;
+  }
+  char fitted[80];
+  fitText(fitted, sizeof(fitted), c3src[0] ? c3src : "--", VALUE_MAX_W);
+  drawCardBase(CARD_Y[2]);
+  drawCardValue(CARD_Y[2], fitted, c3src[0] ? COL_TEXT : COL_TEXT2);
+  drawCardRow1(CARD_Y[2], c3label, nullptr);
+
   drawPageDots(page, pageCount);
   drawStatusBar(ip);
 }

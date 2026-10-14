@@ -6,3 +6,5 @@
 *.map
 compile_commands.json
 data/config.json
+__pycache__/
+tools/agent-bridge/*.log

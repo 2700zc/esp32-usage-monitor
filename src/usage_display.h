@@ -1,4 +1,5 @@
 #pragma once
+#include "agent_client.h"
 #include "deepseek_client.h"
 #include "opencode_client.h"
 #include "commandcode_client.h"
@@ -10,6 +11,8 @@
 //
 // netStatus 非空时用作页头状态文案（WiFi 断开时传「网络断开」），优先级高于
 // 数据自带的 lastError。
+void usageDisplayDrawAgent(const AgentStatus& data, const char* ip, int page, int pageCount,
+                           const char* netStatus = nullptr);
 void usageDisplayDrawDs(const DeepSeekUsage& data, const char* ip, int page, int pageCount,
                         const char* netStatus = nullptr);
 void usageDisplayDrawOc(const OpenCodeUsage& data, const char* ip, int page, int pageCount,
