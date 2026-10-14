@@ -213,7 +213,8 @@ static void drawHeaderStatus(const char* name, uint16_t accent, const char* subt
 // 整页提示卡片：只在「从没成功获取过」时用。
 // 行距按 wqy16 size1（18px）与 wqy12 size1（13px）排，互不重叠。
 static void drawStatusBody(const char* title, uint16_t titleColor, const char* reason,
-                           const char* detail, const char* ip, int page, int pageCount) {
+                           const char* detail, const char* ip, int page, int pageCount,
+                           const char* hint = "60 秒后自动重试") {
   drawGradCard(76, 104, 0x220D, 0x0883);
   spr.setFont(u8g2_font_wqy16_t_gb2312b);
   spr.setTextColor(titleColor);
@@ -229,7 +230,7 @@ static void drawStatusBody(const char* title, uint16_t titleColor, const char* r
     spr.print(detail);
   }
   spr.setCursor(UI_M + 16, 172);
-  spr.print("60 秒后自动重试");
+  spr.print(hint);
 
   drawPageDots(page, pageCount);
   drawStatusBar(ip);
@@ -509,13 +510,12 @@ void usageDisplayDrawAgent(const AgentStatus& data, const char* ip, int page, in
   char httpTxt[16] = "";
   const char* reason = nullptr;
   switch (data.lastError) {
-    case agErrNoUrl:   reason = "未配置桥接地址"; break;
     case agErrBadUrl:  reason = "桥接地址格式不对"; break;
     case agErrNetwork: reason = "连不上桥接"; break;
     case agErrHttp:    snprintf(httpTxt, sizeof(httpTxt), "HTTP %d", data.lastHttp);
                        reason = httpTxt; break;
     case agErrParse:   reason = "数据解析失败"; break;
-    default:           break;     // agErrOk
+    default:           break;     // agErrOk，以及搜索中的两种（下面单独处理）
   }
   if (netStatus) reason = netStatus;
   // 桥接自己说这个状态可能过期了（会话进程中途没了、事件断了），按失败处理：
@@ -523,10 +523,24 @@ void usageDisplayDrawAgent(const AgentStatus& data, const char* ip, int page, in
   if (!reason && data.valid && data.stale) reason = "状态可能已过期";
 
   if (!data.valid) {
-    // 从没成功过：整页提示
+    // 三种情况要分开说，别都糊成"获取失败"：还在广播找桥接（正常过程）、
+    // 找了一分钟没人应答（该去 PC 上看看了）、有地址但取不到（桥接没开/防火墙）
+    const char* title;
+    const char* sub;
+    const char* hint = "自动重试中";
+    uint16_t    tcol;
+    if (data.lastError == agErrSearching) {
+      title = "正在查找桥接"; tcol = COL_TEXT2; sub = "局域网广播中";
+    } else if (data.lastError == agErrNotFound) {
+      title = "没找到桥接";   tcol = COL_TEXT2; sub = "确认 PC 上 bridge.py 在运行";
+      hint  = "每分钟再找一次";
+    } else {
+      title = reason ? "获取失败" : "正在获取";
+      tcol  = reason ? COL_RED : COL_TEXT2;
+      sub   = reason ? reason : "等待首次刷新";
+    }
     drawHeader("ZCode", COL_AGENT, "Agent 状态", COL_TEXT2);
-    drawStatusBody(reason ? "获取失败" : "正在获取", reason ? COL_RED : COL_TEXT2,
-                   reason ? reason : "等待首次刷新", data.lastDetail, ip, page, pageCount);
+    drawStatusBody(title, tcol, sub, data.lastDetail, ip, page, pageCount, hint);
     return;
   }
 

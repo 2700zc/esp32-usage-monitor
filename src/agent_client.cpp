@@ -4,12 +4,29 @@
 #include <stdlib.h>
 #include <string.h>
 
+const char AGENT_PROBE[] = "ZCODE-AGENT-V1?";
+
+// 应答前缀必须连端口一起整串匹配："ZCODE-AGENT-V1 8787"。只比前缀的话，
+// 状态推送的 JSON 万一以同样的字符串开头就会被当成应答。
+static const char AGENT_REPLY_PREFIX[] = "ZCODE-AGENT-V1 ";
+
+bool agParseReply(const char* buf, int len, uint16_t& httpPort) {
+  const size_t pl = strlen(AGENT_REPLY_PREFIX);
+  if (len <= (int)pl) return false;
+  if (strncmp(buf, AGENT_REPLY_PREFIX, pl) != 0) return false;
+  char* end = nullptr;
+  long p = strtol(buf + pl, &end, 10);
+  if (end == buf + pl || p <= 0 || p > 65535) return false;
+  httpPort = (uint16_t)p;
+  return true;
+}
+
 // agent_url -> host / port / path。只支持明文 http://：桥接跑在局域网里，
 // 用 TLS 既没意义（自签证书还得 setInsecure）也要多花几百毫秒握手，与
 // "每秒轮询"这个节奏冲突。写成 https:// 直接报错而不是悄悄降级，免得
 // 用户以为自己配对了。
-static bool parseUrl(const char* url, char* host, size_t hostSz,
-                     uint16_t& port, char* path, size_t pathSz) {
+bool agParseUrl(const char* url, char* host, size_t hostSz,
+                uint16_t& port, char* path, size_t pathSz) {
   const char* p = url;
   if (strncmp(p, "http://", 7) == 0) {
     p += 7;
@@ -75,21 +92,8 @@ bool agApply(AgentStatus& out, const char* json, bool pushed) {
   return true;
 }
 
-bool agFetch(AgentStatus& out, const char* url) {
+bool agFetchHost(AgentStatus& out, const char* host, uint16_t port, const char* path) {
   // 失败不清 valid：界面继续显示上一次的状态，只把页头换成琥珀色的过期提示。
-  if (!url || !url[0]) {
-    out.lastError = agErrNoUrl;
-    return false;
-  }
-  char host[48], path[64];
-  uint16_t port = 0;
-  if (!parseUrl(url, host, sizeof(host), port, path, sizeof(path))) {
-    out.lastError = agErrBadUrl;
-    snprintf(out.lastDetail, sizeof(out.lastDetail), "%s", url);
-    Serial.printf("ag: bad url: %s\n", url);
-    return false;
-  }
-
   String body;
   int st = httpGetPlain("ag", host, port, path, nullptr, 0, body);
   if (st != 200) {

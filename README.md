@@ -144,6 +144,10 @@ python tools/agent-bridge/bridge.py
 把桥接打印的地址填进 `data/config.json` 的 `agent_url`，重刷文件系统即可。
 细节、接口定义和排查表见 [`tools/agent-bridge/README.md`](tools/agent-bridge/README.md)。
 
+**`agent_url` 现在是可选的**：板子会在局域网里自己广播找桥接（跨子网时退化成按上次那台
+PC 的网段逐个单播），所以换电脑、PC 换了 IP 都不用重刷固件。填上仍然更好——开机第一次
+就直连成功，不需要等发现过程，同时那个地址还充当"该扫哪个网段"的种子。
+
 > **桥接必须在 ZCode 的进程树之外启动。** 从 ZCode 会话里拉起来的进程会随 ZCode
 > 重启一起被杀，设备就显示「连不上桥接」。双击 `tools/agent-bridge/start-bridge.bat`
 > 是对的；开机自启也已装好（启动文件夹里一条 `ZCode agent bridge.lnk` → 隐藏启动，

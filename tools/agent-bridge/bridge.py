@@ -41,6 +41,16 @@ EVENT_STATE = {
     "Stop": "done",
 }
 
+# ── 局域网发现 ────────────────────────────────────────────────────────────
+# 设备不知道桥接在哪台机器上（换电脑 / DHCP 换 IP 都不该重刷固件），所以它
+# 广播一句问话、或者按上次记住的网段逐个单播，谁在跑桥接谁应答。应答里带
+# HTTP 端口，设备从报文源地址拿到 IP，于是不再需要任何手工配置。
+#
+#   设备 -> 广播/单播 :8789   "ZCODE-AGENT-V1?"
+#   桥接 -> 单播回源端口       "ZCODE-AGENT-V1 8787"
+AGENT_PROBE = b"ZCODE-AGENT-V1?"
+AGENT_REPLY = b"ZCODE-AGENT-V1 %d"
+
 class Bridge:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -210,6 +220,22 @@ class Bridge:
                 # 一个畸形事件不该让整个监听线程静默退出
                 print(f"  !! ingest failed: {type(e).__name__}: {e}", flush=True)
 
+    def discovery_listener(self, sock: socket.socket) -> None:
+        print(f"discovery     udp 0.0.0.0:{self.args.discovery_port} "
+              f"(replies with http port {self.args.http_port})", flush=True)
+        while True:
+            try:
+                data, addr = sock.recvfrom(512)
+            except OSError:
+                continue
+            if data.strip() != AGENT_PROBE:
+                continue
+            try:
+                sock.sendto(AGENT_REPLY % self.args.http_port, addr)
+                print(f"  discovery reply -> {addr[0]}:{addr[1]}", flush=True)
+            except OSError as e:
+                print(f"  !! discovery reply to {addr} failed: {e}", flush=True)
+
 
 class Server(ThreadingHTTPServer):
     # 默认的 allow_reuse_address=1 会让两个实例绑同一个端口都成功，于是出现
@@ -276,6 +302,12 @@ def main() -> int:
                          "finished one (default 20)")
     ap.add_argument("--idle-after", type=float, default=900.0,
                     help="seconds without events before a busy state falls back to idle")
+    ap.add_argument("--discovery-port", type=int, default=8789,
+                    help="UDP port the ESP32 broadcasts its discovery probe to "
+                         "(default 8789, must match the firmware)")
+    ap.add_argument("--no-discovery", action="store_true",
+                    help="do not answer discovery probes; the device must be "
+                         "given this address in agent_url")
     ap.add_argument("--no-push", action="store_true",
                     help="poll only; disable the instant UDP push to the device")
     args = ap.parse_args()
@@ -305,15 +337,38 @@ def main() -> int:
         return 1
     threading.Thread(target=bridge.udp_listener, args=(udp,), daemon=True).start()
 
+    # 发现端口绑在 0.0.0.0 上（要收局域网广播）；绑不上只警告不退出——
+    # 老固件靠 agent_url 也照常能用，不值得因此拒绝启动。
+    if not args.no_discovery:
+        disc = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            disc.bind(("0.0.0.0", args.discovery_port))
+        except OSError as e:
+            print(f"!! cannot bind udp 0.0.0.0:{args.discovery_port} -- {e}\n"
+                  f"   discovery disabled; the device needs a static agent_url",
+                  file=sys.stderr, flush=True)
+            disc = None
+        if disc is not None:
+            threading.Thread(target=bridge.discovery_listener, args=(disc,),
+                             daemon=True).start()
+
     ip = lan_ip()
     print(f"ZCode agent bridge up")
     print(f"  device poll   http://{ip}:{args.http_port}/agent")
     print(f"  instant push  udp   -> device:{args.udp_port} "
           f"({'disabled' if args.no_push else 'after first poll'})")
-    print(f"  firmware config:  \"agent_url\": \"http://{ip}:{args.http_port}/agent\"")
-    print(f"  if the device cannot reach it, allow the port once (admin cmd):")
+    if args.no_discovery:
+        print(f"  discovery     disabled (firmware config: "
+              f"\"agent_url\": \"http://{ip}:{args.http_port}/agent\")")
+    else:
+        print(f"  discovery     the device finds this bridge by itself; "
+              f"agent_url may be left empty")
+    print(f"  if the device cannot reach it, allow the ports once (admin cmd):")
     print(f"    netsh advfirewall firewall add rule name=\"ZCode agent bridge\" "
           f"dir=in action=allow protocol=TCP localport={args.http_port} profile=private")
+    if not args.no_discovery:
+        print(f"    netsh advfirewall firewall add rule name=\"ZCode agent discovery\" "
+              f"dir=in action=allow protocol=UDP localport={args.discovery_port} profile=private")
     print()
 
     try:

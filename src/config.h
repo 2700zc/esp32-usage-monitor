@@ -27,7 +27,9 @@ inline bool cfgOcReady(const AppConfig& c) {
 }
 inline bool cfgCcReady(const AppConfig& c) { return c.cc_cookie[0] != 0; }
 inline bool cfgDsReady(const AppConfig& c) { return c.ds_token[0] != 0; }
-inline bool cfgAgentReady(const AppConfig& c) { return c.agent_url[0] != 0; }
+// 状态页总是存在：板子会在局域网里自己广播找桥接，所以不填 agent_url 也能用；
+// 填了则先用它，取不到再退回发现（换电脑/换 IP 时不用重刷文件系统）。
+inline bool cfgAgentReady(const AppConfig&) { return true; }
 
 // 复制并去掉首尾空白。手写 JSON 时很容易在值前后留下空格或换行，而" "是非空
 // 字符串，会被当成"已配置"，于是生成一个必然失败的页面。
