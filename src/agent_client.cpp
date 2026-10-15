@@ -1,10 +1,40 @@
 #include "agent_client.h"
 #include "http_client.h"
 #include <ArduinoJson.h>
+#include <Preferences.h>
 #include <stdlib.h>
 #include <string.h>
 
 const char AGENT_PROBE[] = "ZCODE-AGENT-V1?";
+
+// NVS 命名空间独立于 WiFi 那份（"buddy"），别互相覆盖
+static const char* AGENT_NVS_NS = "agent";
+static Preferences s_prefs;
+
+bool agLoadLastHost(char* host, size_t hostSz, uint16_t& port) {
+  s_prefs.begin(AGENT_NVS_NS, true);  // 只读
+  String h = s_prefs.getString("host", "");
+  unsigned long p = s_prefs.getUShort("port", 0);
+  s_prefs.end();
+  if (h.length() == 0 || p == 0 || p > 65535) return false;
+  strlcpy(host, h.c_str(), hostSz);
+  port = (uint16_t)p;
+  return true;
+}
+
+void agSaveLastHost(const char* host, uint16_t port) {
+  char cur[48];
+  uint16_t curPort = 0;
+  if (agLoadLastHost(cur, sizeof(cur), curPort) &&
+      strcmp(cur, host) == 0 && curPort == port) {
+    return;  // 没变就不写：NVS 是闪存，能省一次擦写就省一次
+  }
+  s_prefs.begin(AGENT_NVS_NS, false);
+  s_prefs.putString("host", host);
+  s_prefs.putUShort("port", port);
+  s_prefs.end();
+  Serial.printf("agent: remembered bridge %s:%u\n", host, (unsigned)port);
+}
 
 // 应答前缀必须连端口一起整串匹配："ZCODE-AGENT-V1 8787"。只比前缀的话，
 // 状态推送的 JSON 万一以同样的字符串开头就会被当成应答。

@@ -1,289 +1,391 @@
-# ESP32-S3 用量监视器
+# ESP32-S3 AI 用量监视器
 
-在 Waveshare ESP32-S3-Touch-AMOLED-2.16 开发板上显示 AI 编程服务用量的桌面小仪表盘。
-左右滑动屏幕在 ZCode 状态和三个服务商之间切换。
+一块放在桌上的小屏幕，抬眼就能看到两件事：**你的 AI 编程服务还剩多少额度**，以及
+**ZCode 此刻在干什么**（正在思考 / 执行工具 / 等待授权 / 思考完成）。左右滑动切页。
 
-## 功能
+硬件是 Waveshare ESP32-S3-Touch-AMOLED-2.16（480×480 AMOLED + 触摸），固件用
+PlatformIO + Arduino 框架，配置放在板子的文件系统里，凭据不经过任何第三方服务器。
 
-- **四页，滑动切换**（页面顺序 ZCode 状态 → OpenCode Go → CommandCode → DeepSeek）：
-  - **ZCode 状态**：正在思考 / 执行工具 / 等待授权 / 思考完成 / 空闲；
-    第二行是工具名，第三行是它此刻在做什么（Bash 的命令、Edit 的文件名），
-    不在执行时显示会话所属的项目名
-  - **OpenCode Go**：滚动用量 / 每周用量 / 每月用量（百分比 + 距重置倒计时）
-  - **CommandCode**：滚动用量 / 每周用量 / 每月用量（同上）
-  - **DeepSeek**：今日请求数、今日 Tokens（完整千分位）、账户余额（低于 5 元变红警示）
-- 用量达到 100% 时数字变红
-- **左右滑动**切页，到底循环；底部圆点指示当前页
-- 用量每 60 秒刷新一轮；按 **PWR（中键）** 可立即刷新
-- ZCode 状态每秒刷新一次，状态一变立即推送（亚秒级）
-- 深色 AMOLED 界面：纯黑背景 + 深灰圆角卡片 + 各服务商品牌色
-- WiFi 屏幕配置界面（扫描网络 + 软键盘输密码），首次配置后开机自动连接
-- 自动连接超过 10 秒失败会回到 WiFi 配置界面重新选择
-- 配置存储在 LittleFS 文件系统
+```
+┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+│ ● ZCode     14:32│  │ ● OpenCode Go    │  │ ● CommandCode    │  │ ● DeepSeek       │
+│   Agent 状态·3秒前│  │   用量窗口·刚刚   │  │   用量窗口·刚刚   │  │   今日用量·刚刚   │
+│ ┌──────────────┐ │  │ ┌──────────────┐ │  │ ┌──────────────┐ │  │ ┌──────────────┐ │
+│ │ ZCode 状态 1个│ │  │ │ 滚动用量  2时  │ │  │ │ 滚动用量  3时  │ │  │ │ 今日请求数    │ │
+│ │ 正在思考     │ │  │ │ 0.54%        │ │  │ │ 3.01%        │ │  │ │ 128 次       │ │
+│ └──────────────┘ │  │ └──────────────┘ │  │ └──────────────┘ │  │ └──────────────┘ │
+│ ┌──────────────┐ │  │ ┌──────────────┐ │  │ ┌──────────────┐ │  │ ┌──────────────┐ │
+│ │ 当前工具     │ │  │ │ 每周用量  5天  │ │  │ │ 每周用量  5天  │ │  │ │ 今日 Tokens   │ │
+│ │ Bash         │ │  │ │ 18.11%       │ │  │ │ 41.2%        │ │  │ │ 1,234,567    │ │
+│ └──────────────┘ │  │ └──────────────┘ │  │ └──────────────┘ │  │ └──────────────┘ │
+│ ┌──────────────┐ │  │ ┌──────────────┐ │  │ ┌──────────────┐ │  │ ┌──────────────┐ │
+│ │ 当前动作     │ │  │ │ 每月用量  2周  │ │  │ │ 每月用量  2周  │ │  │ │ 账户余额  CNY │ │
+│ │ pio run -e … │ │  │ │ 14.43%       │ │  │ │ 22.8%        │ │  │ │ ¥ 42.15      │ │
+│ └──────────────┘ │  │ └──────────────┘ │  │ └──────────────┘ │  │ └──────────────┘ │
+│    ·  ○  ○  ○    │  │    ○  ●  ○  ○    │  │    ○  ○  ●  ○    │  │    ○  ○  ○  ●    │
+└──────────────────┘  └──────────────────┘  └──────────────────┘  └──────────────────┘
+```
 
-只配置了其中一家的凭据时，只有那一页，滑动无效果。
+## 目录
 
-## 硬件
+- [功能一览](#功能一览)
+- [硬件需求](#硬件需求)
+- [快速开始](#快速开始)：装环境 → 取代码 → 填配置 → 烧写 → 首次开机
+- [配置详解](#配置详解)：每个凭据从哪里拿
+- [ZCode 状态页完整教程](#zcode-状态页完整教程)：PC 端装 hook 与桥接
+- [日常使用](#日常使用)：按键、滑动、刷新
+- [换电脑 / 换网络](#换电脑--换网络)：不用重刷固件的那些办法
+- [常见问题与排查](#常见问题与排查)
+- [项目结构](#项目结构)
+- [开发](#开发)：构建、串口、调试开关
+- [安全与隐私](#安全与隐私)：凭据都在哪、什么东西不会被提交
 
-- **开发板**: Waveshare ESP32-S3-Touch-AMOLED-2.16
-- **屏幕**: 480×480 AMOLED (CO5300 驱动)
-- **触摸**: CST9220
-- **PSRAM**: 8MB | **Flash**: 16MB
+## 功能一览
 
-## 环境搭建
+- **四页滑动切换**，顺序：ZCode 状态 → OpenCode Go → CommandCode → DeepSeek
+  - **ZCode 状态**：正在思考 / 执行工具 / 等待授权 / 思考完成 / 空闲；第二行是工具名，
+    第三行是**它此刻在做什么**（Bash 的执行命令、Edit 的文件名），不在执行时显示会话
+    所属的项目名。状态变化在**亚秒级**推到屏幕上
+  - **OpenCode Go / CommandCode**：滚动 / 每周 / 每月用量（百分比 + 距重置倒计时），
+    到 100% 数字变红
+  - **DeepSeek**：今日请求数、今日 Tokens（千分位）、账户余额（低于 5 元变红）
+- 用量**每 60 秒**刷新一轮；**PWR 键**随时手动刷新
+- **左右滑动**切页，到底循环，底部圆点指示当前位置
+- **WiFi 配置界面直接做在屏幕上**（扫描 + 软键盘输密码），配好之后开机自动连接
+- 深色 AMOLED 界面：纯黑背景 + 深灰圆角卡片 + 各家品牌色
+- 刷新失败**不会清空页面**：继续显示上一次的数据，页头用琥珀色标出失败原因与数据年龄
 
-1. 安装 [PlatformIO](https://platformio.org/)
-2. 克隆仓库：
-   ```bash
-   git clone https://github.com/2700zc/esp32-usage-monitor.git
-   cd esp32-usage-monitor
-   ```
+只配了其中一家的凭据时，就只有那一页 + ZCode 状态页（ZCode 页始终存在，见下）。
 
-## 配置
+## 硬件需求
 
-复制配置模板并填入你的信息：
+| 项目 | 要求 |
+|---|---|
+| 开发板 | Waveshare **ESP32-S3-Touch-AMOLED-2.16**（ESP32-S3R8 / 16MB Flash / 8MB OPI PSRAM） |
+| 屏幕 | 480×480 AMOLED（CO5300），电容触摸（CST9220） |
+| 数据线 | USB-C，**要能传数据**（不少线只能供电，插上找不到串口就是这类） |
+| 网络 | 2.4GHz WiFi，且与跑桥接的电脑互通（见[换电脑 / 换网络](#换电脑--换网络)） |
+| 电脑 | Windows（脚本按 Windows 写的；固件本身跨平台） |
+
+## 快速开始
+
+### 1. 装开发环境
+
+- [PlatformIO](https://platformio.org/)：VS Code 装 PlatformIO 插件，或直接 `pip install platformio`
+- 首次编译要下载 ESP32 工具链，**冷编译大约十几分钟**，之后增量编译一分钟左右
+
+### 2. 取代码
+
+```bash
+git clone https://github.com/2700zc/esp32-usage-monitor.git
+cd esp32-usage-monitor
+```
+
+### 3. 填配置
 
 ```bash
 cp data/config.json.example data/config.json
 ```
 
-`data/config.json` 的字段（模板里每个字段上方都写了中文注释，直接看文件即可）：
+然后编辑 `data/config.json`，按[配置详解](#配置详解)逐项填入。**任意一项留空 = 不显示
+那一页**，留空不影响其他页。
 
-```json
-{
-  "ds_token": "DeepSeek Bearer token",
-  "oc_api_key": "oc_sk_xxxxxxxxxxxx_xxxxxxxxxxxxxxxx",
-  "oc_workspace_id": "wrk_XXXXXXXXXXXX",
-  "oc_cookie": "__Host-console_session=st_xxxxxxxx-...",
-  "cc_cookie": "CommandCode 会话 token",
-  "agent_url": "http://192.168.1.10:8787/agent"
-}
-```
-
-**任意一项留空（或只填了空白字符）就不显示对应的页面**，页面总数自动减少，滑动切页照常可用，也不影响其他页面：
-
-- 只填 `ds_token` → 1 页
-- 填 `ds_token` + `cc_cookie` → 2 页
-- 三家的凭据都填齐 → 4 页（含 ZCode 状态页）
-
-`agent_url` 需要在 PC 上跑一个桥接进程，见下文「ZCode 状态页」。
-
-OpenCode Go 的凭据二选一，任意一条走通就生成页面：
-
-- **`oc_api_key`（推荐）**：Go 套餐的 API key，形如 `oc_sk_xxxxxxxxxxxx_...`，长期有效。
-  在 opencode 控制台生成后填这一项即可，不需要 workspace_id 和 cookie。
-- **`oc_workspace_id` + `oc_cookie`**：浏览器会话，会过期，两项必须同时填。
-
-### OpenCode Go：`oc_api_key`（推荐）
-
-1. 登录 `opencode.ai` 控制台，进入 Go / API keys 页面生成一个 key（`oc_sk_` 开头）
-2. 原样填进 `oc_api_key`
-
-固件以 `Authorization: Bearer <key>` 请求用量接口，实测连 `x-org-id` 与 Referer 都不需要。
-
-### OpenCode Go：`oc_workspace_id` + `oc_cookie`（备选）
-
-1. 登录 `opencode.ai`，打开控制台页面，地址形如
-   `https://opencode.ai/console/wrk_XXXXXXXXXXXX/models`，URL 里那段 `wrk_...` 就是 `oc_workspace_id`
-2. F12 → 网络 (Network)，刷新页面，找 `/console/api/go/status` 的请求
-3. 复制请求头 `cookie` 里 `__Host-console_session=` 后面那一段（形如 `st_xxxxxxxx-xxxx-...`），
-   连名字带值一起填进 `oc_cookie` 也行——固件只认这个 cookie 名
-4. 整串 cookie、或右键该请求「Copy as cURL」得到的整条命令直接粘进去同样可以，
-   固件会自己把 session 挑出来
-
-> 这条路的 session 会过期，届时该页显示"凭据已失效"，重新复制即可，设备上无法登录。
-> 旧的 `auth=Fe26.2**`（配合 `/_server` 接口用的那个 cookie）已经失效，填了会一直报错——那个接口
-> 现在只回一个跳登录页的 302。
-
-### 关于配置文件里的注释
-
-`data/config.json` 里带 `//` 中文注释便于手改。JSON 标准不支持注释，设备端是靠
-`platformio.ini` 里的 `-DARDUINOJSON_ENABLE_COMMENTS=1` 才认识它们——**删掉这个编译选项
-会导致整个配置解析失败、所有页面都消失**，别去掉它。（同一个原因：在头文件里局部
-`#define` 不行，会让不同编译单元看到不一致的配置。）
-
-### DeepSeek：`ds_token`
-
-1. 登录 [platform.deepseek.com/usage](https://platform.deepseek.com/usage)
-2. 打开浏览器开发者工具 (F12) → 网络 (Network)
-3. 刷新页面，找任意 `api/v0/` 开头的请求
-4. 复制请求头 `authorization` 中 `Bearer ` **后面**的部分（不要带 `Bearer ` 前缀）
-
-### OpenCode Go：`oc_workspace_id` / `oc_cookie`
-
-1. 登录 `opencode.ai`，打开控制台页面，地址形如
-   `https://opencode.ai/console/wrk_XXXXXXXXXXXX/models`，URL 里那段 `wrk_...` 就是 `oc_workspace_id`
-2. F12 → 网络 (Network)，刷新页面，找 `/console/api/go/status` 的请求
-3. 复制请求头 `cookie` 里 `__Host-console_session=` 后面那一段（形如 `st_xxxxxxxx-xxxx-...`），
-   连名字带值一起填进 `oc_cookie` 也行——固件只认这个 cookie 名
-4. 整串 cookie、或右键该请求「Copy as cURL」得到的整条命令直接粘进去同样可以，
-   固件会自己把 session 挑出来
-
-> `oc_cookie` 是登录态凭据，会过期（表现为该页显示"cookie 已过期"）。届时重新复制即可，设备上无法登录。
-> 旧的 `auth=Fe26.2**`（配合 `/_server` 接口用的那个 cookie）已经失效，填了会一直报错——那个接口
-> 现在只回一个跳登录页的 302。
-
-### CommandCode：`cc_cookie`
-
-1. 登录 `commandcode.ai`，F12 → 应用 (Application) → Cookie
-2. 找到 `__Secure-commandcode_prod_.session_token`，复制它的**值**（不要带 cookie 名）
-
-## ZCode 状态页（`agent_url`）
-
-让屏幕显示 ZCode 此刻在做什么。第一次配置需要两步（都在 PC 上，只需做一次）：
-
-```bash
-# 1. 装 hook：让 ZCode 把事件报给桥接（会先备份 ~/.zcode/cli/config.json）
-python tools/agent-bridge/install-hooks.py
-#    然后重启 ZCode —— hook 是启动时读取的，当前已开着的会话不会生效
-
-# 2. 常驻跑桥接（也可以直接双击 tools/agent-bridge/start-bridge.bat）
-python tools/agent-bridge/bridge.py
-```
-
-把桥接打印的地址填进 `data/config.json` 的 `agent_url`，重刷文件系统即可。
-细节、接口定义和排查表见 [`tools/agent-bridge/README.md`](tools/agent-bridge/README.md)。
-
-**`agent_url` 现在是可选的**：板子会在局域网里自己广播找桥接（跨子网时退化成按上次那台
-PC 的网段逐个单播），所以换电脑、PC 换了 IP 都不用重刷固件。填上仍然更好——开机第一次
-就直连成功，不需要等发现过程，同时那个地址还充当"该扫哪个网段"的种子。
-
-> **桥接必须在 ZCode 的进程树之外启动。** 从 ZCode 会话里拉起来的进程会随 ZCode
-> 重启一起被杀，设备就显示「连不上桥接」。双击 `tools/agent-bridge/start-bridge.bat`
-> 是对的；开机自启也已装好（启动文件夹里一条 `ZCode agent bridge.lnk` → 隐藏启动，
-> 日志写 `tools/agent-bridge/bridge.log`）。不需要时删掉那个快捷方式即可。
-
-**为什么需要一个 PC 端进程**：ZCode 没有向外发布状态的接口，最接近的扩展点是 hook
-（7 个事件，覆盖"提交提示/调用工具/请求授权/本轮结束"）。hook 是**同步执行**的，
-脚本里不能做网络请求，所以它只往本机发一个 UDP 包（约 1ms），由桥接进程汇聚成一份
-状态，设备再去取。
-
-**两条链路同时工作**：设备每秒轮询一次 `agent_url`（保底 1 秒内的延迟），桥接从轮询
-请求的源地址学到设备位置后，状态一变就再直接 UDP 推一份过去（亚秒级）。所以设备侧
-不需要固定 IP，桥接侧也不用配置设备地址。状态页"正在执行"卡片右侧会显示这一份是
-「实时」（推送）还是「轮询」取的，排查链路时一眼能分辨。
-
-**状态与来源事件的对应**：`UserPromptSubmit` → 正在思考；`PreToolUse` → 执行工具（带
-工具名）；`PermissionRequest` → 等待授权；`Stop` → 思考完成。同时开多个会话或子智能体
-时按"最新的优先、需要人管的优先"取一个显示。
-
-**第三行显示什么**：执行中显示动作本体——Bash 是命令、Edit/Read 是文件名、Grep 是
-pattern、等待授权时是它想执行的东西；不在执行时显示项目名（会话的工作目录名），这样
-同时开几个窗口也能一眼看出这块屏幕在说哪个项目。命令里的长串无分隔字符（API key、
-哈希）会被替换成 `…` 再上屏，也不会进那个局域网明文接口。
-
-> 没有 token 级的流式事件，所以粒度就到"轮次/工具"这一层——显示的是"正在思考"，
-> 不是逐字输出。桥接不在、PC 换网络导致 IP 变了的时候，该页显示「连不上桥接」，
-> 其他三页不受影响。
-
-## 编译与上传
+### 4. 编译与烧写
 
 ```bash
 # 编译
 pio run -e esp32-usage-monitor
 
-# 上传固件
-pio run -e esp32-usage-monitor -t upload
+# 烧固件（板子插在哪就写哪个口）
+pio run -e esp32-usage-monitor -t upload --upload-port COM5
 
-# 上传文件系统（包含 config.json）
-pio run -e esp32-usage-monitor -t uploadfs
+# 烧文件系统（config.json 在这里面）
+pio run -e esp32-usage-monitor -t uploadfs --upload-port COM5
 ```
 
-> **别把 `-t upload` 和 `-t uploadfs` 写在一条命令里。** 实测（PlatformIO Core 6.1.19）
+> ⚠️ **不要把 `-t upload` 和 `-t uploadfs` 写在同一条命令里。** 实测（PlatformIO Core 6.1.19）
 > 两个目标同时指定时文件系统上传会顶掉固件上传，日志里只有 `Uploading ...littlefs.bin`
-> 而没有 `firmware.bin`，固件实际没刷进去且不会报错。请分两条命令依次执行，并确认日志里
-> 出现了 `Wrote ... at 0x00010000`。
+> 而没有 `firmware.bin`，**固件实际没刷进去且不报错**。请分两条命令依次执行，并确认日志里
+> 出现过 `Wrote ... at 0x00010000`。
 
-指定端口（板子插在电脑上时）加 `--upload-port COM5`。
+> 💡 串口不确定是哪个：Windows 设备管理器里认 **VID:PID = 303A** 那个。蓝牙虚拟串口
+> （常见 COM3/COM4）长得像但不能烧写。
 
-## 使用说明
+### 5. 首次开机
 
-1. 首次启动进入 WiFi 配置界面（自动扫描附近网络）
-2. 三个按键操作：
-   - **PWR（中）**: 列表中选下一个
-   - **IO18（左）**: 列表中选上一个
-   - **BOOT（右）**: 确认进入密码输入
-3. 软键盘输入密码：PWR/IO18 移动光标（长按连发），BOOT 输入字符；底行功能键为 模式切换 / 删除 / 空格 / OK
-4. 连接成功后进入用量页面，自动刷新
-5. **左右滑动**切换服务商页面，底部圆点指示当前位置
-6. 之后开机自动连接已保存的 WiFi；超过 10 秒连不上会自动回到 WiFi 配置界面
-7. 随时按 **BOOT** 可重新进入 WiFi 配置
-8. 用量页面按 **PWR** 立即刷新一轮
+1. 上电后自动进入 **WiFi 配置界面**（扫描附近网络）
+2. 三个实体键操作：
+   - **PWR（中）**：列表中选下一个
+   - **IO18（左）**：列表中选上一个
+   - **BOOT（右）**：确认，进入密码输入
+3. 软键盘输密码：**PWR / IO18** 移动光标（长按连发），**BOOT** 输入字符；
+   底行功能键依次是 模式切换 / 删除 / 空格 / OK
+4. 连上后进入页面并开始刷新；之后开机自动连接已保存的 WiFi
+5. 连不上超过 10 秒会自动退回 WiFi 配置界面重新选
 
-### 触摸调试
+> 刚上电那几十秒 DeepSeek 页可能显示"时间未同步"：取值要用到东八区的当天边界，而 NTP 还没
+> 同步完。等一分钟（自动重试一轮）或按 PWR 立刻重试即可，不用重启。
 
-滑动阈值（主方向 35px、时长 800ms 以内、主方向至少是次方向的 1.5 倍）都在画布坐标下，
-与板型无关。每次识别出的滑动都会在串口打印位移，用来核对轴向与方向：
+## 配置详解
+
+`data/config.json` 是带 `//` 注释的 JSON（板子靠 `-DARDUINOJSON_ENABLE_COMMENTS=1` 才认，
+见 `platformio.ini`——**别去掉那个编译选项**，否则整份配置解析失败、所有页面消失）。
+
+| 字段 | 用途 | 留空时 |
+|---|---|---|
+| `ds_token` | DeepSeek 用量/余额 | 不显示 DeepSeek 页 |
+| `oc_api_key` | OpenCode Go（推荐，长期有效） | 见下（可改用 cookie 方式） |
+| `oc_workspace_id` + `oc_cookie` | OpenCode Go 的备选（浏览器会话） | 不显示 OpenCode Go 页 |
+| `cc_cookie` | CommandCode 用量 | 不显示 CommandCode 页 |
+| `agent_url` | ZCode 状态页的桥接地址（**可选**，只是个种子） | 靠自动发现找桥接 |
+
+### DeepSeek：`ds_token`
+
+1. 登录 <https://platform.deepseek.com/usage>
+2. F12 → 网络 → 刷新页面 → 点任意 `api/v0/` 开头的请求
+3. 复制请求头 `authorization` 里 **`Bearer ` 后面**的部分（不要带前缀）
+
+> 这是网页登录态 token，会过期；过期后该页显示"时间未同步"或获取失败。
+
+### OpenCode Go：`oc_api_key`（推荐）
+
+在 opencode.ai 控制台 → Go / API keys 生成一个 `oc_sk_` 开头的 key，原样填入。
+实测它长期有效，且请求时连 `x-org-id`、Referer 都不需要。
+
+### OpenCode Go：`oc_workspace_id` + `oc_cookie`（备选）
+
+1. `oc_workspace_id`：控制台地址 `https://opencode.ai/console/wrk_XXXXXXXXXXXX/models`
+   里那段 `wrk_...`
+2. `oc_cookie`：F12 → 网络 → 找 `/console/api/go/status` 请求 → 复制请求头 `cookie` 里
+   `__Host-console_session=` 那一段（连名字带值一起填也行，固件只认这个名字）
+3. 整串 cookie、或右键该请求「Copy as cURL」得到的整条命令直接粘进去也可以，固件会自己挑
+
+> 这条路是浏览器会话，会过期，届时该页显示"凭据已失效"，重新复制即可。
+> 旧的 `auth=Fe26.2**` 已经失效（`/_server` 接口现在只回 302 跳登录页），别填那个。
+
+### CommandCode：`cc_cookie`
+
+登录 commandcode.ai → F12 → 应用(Application) → Cookie → 找到
+`__Secure-commandcode_prod_.session_token`，复制它的**值**（不带 cookie 名）。
+浏览器复制出来是 URL 编码的（含 `%2F`、`%3D`），原样填入即可。
+
+### ZCode 状态：`agent_url`
+
+**可以留空**——板子会在局域网里自己找桥接。想填就填桥接启动时打印的那一行，好处是
+开机第一次就直连成功、不用等发现过程。详见下一节。
+
+## ZCode 状态页完整教程
+
+### 一句话原理
+
+ZCode 本身不向外发布状态，但支持 **hook**（事件回调）。PC 上跑一个小小的桥接进程：
+hook 把事件用 UDP 报给它，它汇总成"当前状态"，设备每秒来取一次，另外状态一变还会
+**主动推**给设备（亚秒级）。设备只管显示。
 
 ```
-swipe: dx=12 dy=-58 -> next
+ZCode ──hook──> zcode-hook.py ──UDP 本机──> bridge.py
+                                              │ HTTP /agent  ← 设备每秒取（保底 1 秒）
+                                              │ UDP 推送     ← 状态一变立刻推（亚秒级）
+                                              │ UDP 发现     ← 设备找桥接 / 桥接喊设备
+                                              ▼
+                                        ESP32 状态页
 ```
 
-**关于轴向**：屏幕经 MADCTL 旋转了 90°（`BOARD_CO5300_MADCTL` 的 MV 位），触控上报的
-x/y 与画布逻辑坐标是**转置**的——`input.cpp` 里那句 `setMirrorXY(true, true)` 只等价于
-180° 镜像，做不到转置。所以判定用的是上报的 y 位移。如果方向反了，把
-`src/hw/gesture.cpp` 末尾 `dy < 0 ? SwipeDir::Left : SwipeDir::Right` 的两个分支对调即可。
+### 第一步：PC 上装 hook（一次性）
 
-要连未识别成滑动的触摸也看到，在 `platformio.ini` 的 `build_flags` 里打开
-`-DTOUCH_DEBUG=1`，然后用 `pio device monitor` 观察每次触摸的画布坐标。
+```bash
+python tools/agent-bridge/install-hooks.py
+```
 
-## 刷新机制
+它会往 `~/.zcode/cli/config.json` 写入 6 个事件的 hook（先自动备份成
+`config.json.bak-<时间戳>`），然后**重启 ZCode** —— hook 是启动时读取的。
 
-用量每 60 秒触发一轮刷新，把已配置的服务商各抓一遍。三家**分摊到连续的多帧**里完成，
-每帧只抓一个，帧间照常重绘并响应触摸，因此最长无响应时间约等于单个服务商（1~1.5 秒），
-而不是三家之和。某一家的请求失败只影响它自己那一页，其他页保留上一次的数据。
+> 代价要知道：hook 是同步执行的，于是**每个 ZCode 会话的每次工具调用会多起一个
+> python 进程（约 80ms）**。不想要了就 `python tools/agent-bridge/install-hooks.py --uninstall`。
 
-**ZCode 状态页不参与这个轮次**：它按秒轮询（桥接在局域网里，一次请求几十毫秒），
-因为状态是"此刻"的事，塞进 60 秒轮次里等于最多滞后一分钟。桥接连不上时按失败次数
-退避到最长 30 秒一次——否则每秒一次的连接超时会把滑动和重绘卡死。
+### 第二步：PC 上常驻桥接
+
+```bash
+python tools/agent-bridge/bridge.py
+```
+
+也可以双击 `tools/agent-bridge/start-bridge.bat`（带窗口，窗口里实时打印事件，调试用），
+或者 `bridge-daemon.bat`（无窗口，日志写 `bridge.log`）。
+
+启动后会打印设备需要的地址、以及需要放行的防火墙命令：
+
+```
+ZCode agent bridge up
+  device poll   http://192.168.1.10:8787/agent
+  instant push  udp   -> device:8788 (after first poll)
+  discovery     the device finds this bridge by itself; agent_url may be left empty
+  if the device cannot reach it, allow the ports once (admin cmd):
+    netsh advfirewall firewall add rule name="ZCode agent bridge" dir=in action=allow protocol=TCP localport=8787 profile=private
+    netsh advfirewall firewall add rule name="ZCode agent discovery" dir=in action=allow protocol=UDP localport=8789 profile=private
+```
+
+首次连不上就把那两条 `netsh` 命令用**管理员** cmd 跑一遍（设备是主动连过来的那一方，
+入站被拦是最常见的原因）。
+
+> ⚠️ **桥接必须在 ZCode 的进程树之外启动**。从 ZCode 会话里拉起来的进程会随 ZCode
+> 重启一起被杀，设备就显示"连不上桥接"（这个坑我们踩过）。
+
+### 第三步：让桥接开机自启（推荐）
+
+双击一次 `start-bridge.bat` 能跑，但重启电脑就没了。二选一：
+
+- **启动文件夹**：`Win+R` → `shell:startup` → 把 `bridge-hidden.vbs` 的快捷方式丢进去
+  （无窗口启动，日志仍然写 `bridge.log`）；
+- **手动**：每次开机双击 `start-bridge.bat`。
+
+### 第四步：确认它工作
+
+重启 ZCode 后随便发一句话，桥接窗口里应该立刻出现：
+
+```
+14:32:05   UserPromptSubmit   sess_xxxxxxxx   thinking   esp32-usage-monitor   sessions=1
+14:32:09   PreToolUse         sess_xxxxxxxx   Bash       pio run -e esp32-…    sessions=1
+14:32:34   Stop               sess_xxxxxxxx   done       esp32-usage-monitor   sessions=1
+```
+
+同时屏幕上应该看到 正在思考 → 执行工具(Bash) → 思考完成。状态页"当前工具"那行右侧
+会写 **「实时」**（这份状态来自 UDP 推送）或 **「轮询」**（来自每秒的 HTTP 轮询）——
+排查链路时看这两个字就知道走的是哪条路。
+
+### 事件到状态的映射
+
+| ZCode 事件 | 屏幕状态 |
+|---|---|
+| `UserPromptSubmit` | 正在思考 |
+| `PreToolUse` | 执行工具（带工具名） |
+| `PostToolUse` / `PostToolUseFailure` | 回到 正在思考 |
+| `PermissionRequest` | 等待授权（这个状态不会随时间衰减） |
+| `Stop` | 思考完成 |
+
+同时开多个会话或子智能体时，按"最新的优先、需要人管的优先"取一个显示（等待授权 >
+执行工具 > 正在思考 > 完成）。子智能体不发 `Stop`，所以它的状态靠超时降级。
+
+### 端口一览
+
+| 端口 | 方向 | 用途 |
+|---|---|---|
+| 8787/TCP | 设备 → PC | 设备每秒轮询状态 |
+| 8788/UDP | hook → PC（本机回环）；PC → 设备 | hook 上报事件；桥接即时推状态 |
+| 8789/UDP | 双向 | 局域网发现（设备找桥接 / 桥接喊设备） |
+
+## 日常使用
+
+| 操作 | 效果 |
+|---|---|
+| 左右滑动 | 切页，到底循环 |
+| **PWR（中键）** | 立刻刷新用量；同时让状态页立刻重试（不用等退避） |
+| **BOOT（右键）** | 重新进入 WiFi 配置界面 |
+| 断电重开 | 自动连 WiFi，并从上次那台 PC 恢复状态页 |
+
+用量每 60 秒刷新一轮，四家**分摊到连续的多帧**里做，每帧只抓一个：最长无响应时间
+约等于单个服务商（1~1.5 秒），而不是四家之和，所以滑动始终跟手。
+
+## 换电脑 / 换网络
+
+**结论：一般不需要重刷固件。** 设备找桥接有三条路，从快到慢：
+
+1. **NVS 记忆**：设备把最后连上的桥接地址存在自己的闪存里，重启后直接照它连 —— 同一个
+   地方重启，立刻恢复。
+2. **桥接主动喊**：桥接把来轮询过的设备记在 `tools/agent-bridge/devices.json`，设备
+   超过 45 秒没来就朝它单播一条"桥接在这儿"，每 10 秒一次。实测把板子复位成"记着另一个
+   网段的地址"的状态，45 秒后被自动找回。**这条覆盖"换电脑/搬到新地方"**。
+3. **设备自己找**：广播（扁平局域网有效）+ 按种子地址所在 /24 逐个单播（能跨网段）。
+   轮询连续失败 5 次触发。
+
+真正需要动手的只有两种情况：
+
+- **第一次到一个全新的地方**：桥接那边还没有任何设备记忆，也就不知道该喊谁。用
+  `python tools/agent-bridge/bridge.py --announce-to <板子IP>` 引导一次，之后它就记住了。
+- **板子的 WiFi 也换了**（换了路由器/换了网段）：那要在板子上重配 WiFi——按 **BOOT** 键
+  进配置界面，扫描选网络、输密码。这跟桥接是两件独立的事。
+
+同一个局域网里两台电脑都跑桥接也可以，设备只会认它当前连上的那台。
+
+## 常见问题与排查
+
+| 现象 | 原因 / 处理 |
+|---|---|
+| 插上后找不到串口 | 数据线只能供电；或需要装 CH343/USB-JTAG 驱动。认 VID:PID `303A` |
+| 烧写完页面还是旧的 | `uploadfs` 和 `upload` 写在了同一条命令里，文件系统顶掉了固件（见上） |
+| 页面显示"未配置服务商" | `data/config.json` 没填 / 没 `uploadfs` / JSON 注释被关掉了 |
+| 某页显示"凭据已失效" | 该服务的 token/cookie 过期，重新复制填上再 `uploadfs` |
+| DeepSeek 页显示"时间未同步" | 刚上电还没同步 NTP，等一分钟或按 PWR 刷新 |
+| 用量不更新 | 看页头副标题：琥珀色的"失败原因 · 数据年龄"就是上一次刷新失败的原因 |
+| 状态页显示"正在查找桥接" | 正常过程：设备在广播找桥接（2→32 秒退避） |
+| 状态页显示"没找到桥接" | 一分钟没找到。看 PC 上桥接是否在跑、防火墙是否放行 UDP 8789；第一次到新地方用 `--announce-to` |
+| 状态页显示"连不上桥接" | 桥接不在（**最常见：它是从 ZCode 会话里启的，ZCode 一重启就被带走了**）、PC 换了 IP、防火墙 |
+| 桥接日志里没有事件 | hook 没装 / ZCode 没重启；看 `tools/agent-bridge/hook-errors.log` |
+| 桥接启动报 `cannot bind udp` | 已经有一个实例在跑，先杀掉旧的（两个实例会让事件只投给其中一个） |
+| 状态停在某个值不动 | 那个会话退出了但没发 `Stop`（子智能体就这样）——等 2 分钟会自动降级 |
+| 触摸方向不对 | `src/hw/gesture.cpp` 末尾两个分支对调（屏幕旋转 90°，判定用的是 y 位移） |
+
+桥接自己的排查表更细，见 [`tools/agent-bridge/README.md`](tools/agent-bridge/README.md)。
 
 ## 项目结构
 
 ```
 ├── data/
-│   ├── config.json          # 运行时配置（已 gitignore）
+│   ├── config.json          # 运行时配置（含凭据，已 gitignore）
 │   └── config.json.example  # 配置模板
 ├── src/
-│   ├── main.cpp             # 主循环：WiFi 状态机 + 页面状态 + 分批刷新 + 状态轮询
-│   ├── http_client.cpp/h    # HTTPS / 明文 HTTP GET（共用按 Content-Length 精确读正文的核心）
-│   ├── usage_types.h        # 通用「用量窗口」结构 + 倒计时格式化
-│   ├── json_util.h          # 共享：JSON 数字取值 / ISO-8601 → epoch / 重置倒计时
-│   ├── agent_client.cpp/h   # ZCode 状态客户端（轮询 + UDP 推送共用解析）
-│   ├── deepseek_client.cpp/h    # DeepSeek 用量/余额客户端
-│   ├── opencode_client.cpp/h    # OpenCode Go 客户端（console/api/go/status）
-│   ├── commandcode_client.cpp/h # CommandCode 客户端（credits + subscriptions）
-│   ├── usage_display.cpp/h  # 四个页面的绘制 + 页码圆点
+│   ├── main.cpp             # 主循环：WiFi 状态机 + 页面状态 + 刷新调度 + 状态发现
+│   ├── http_client.cpp/h    # HTTPS / 明文 HTTP GET（共用精确读正文的核心）
+│   ├── agent_client.cpp/h   # ZCode 状态：轮询、推送解析、局域网发现、地址记忆
+│   ├── deepseek_client.cpp/h    # DeepSeek 用量/余额
+│   ├── opencode_client.cpp/h    # OpenCode Go
+│   ├── commandcode_client.cpp/h # CommandCode
+│   ├── json_util.h          # 共享的 JSON 数字取值 / ISO-8601 / 天数换算
+│   ├── usage_types.h        # 通用"用量窗口"结构 + 倒计时格式化
+│   ├── usage_display.cpp/h  # 四个页面的绘制
 │   ├── wifi_config.cpp/h    # WiFi 配置界面（扫描 + 软键盘）
-│   ├── config.h             # 配置结构体定义 + 加载
-│   └── hw/                  # 硬件驱动层
-│       ├── display.cpp/h    # AMOLED 显示驱动
-│       ├── input.cpp/h      # 按键和触摸输入
-│       ├── gesture.cpp/h    # 滑动手势识别
-│       ├── power.cpp/h      # 电源管理 (AXP2101)
-│       ├── imu.cpp/h        # 加速度计
-│       ├── rtc.cpp/h        # 实时时钟
-│       ├── expander.cpp/h   # IO 扩展器
-│       ├── border.cpp/h     # 边框绘制
-│       ├── net.cpp/h        # 网络工具
-│       ├── pins.h           # 引脚定义
-│       └── hw.cpp/h         # 硬件初始化
+│   ├── config.h             # 配置结构体 + 加载
+│   └── hw/                  # 硬件层：显示 / 输入 / 手势 / 电源 / IMU / RTC / 扩展器
 ├── tools/
-│   └── agent-bridge/        # PC 侧：ZCode 状态桥接（bridge.py + hook + 安装脚本）
+│   └── agent-bridge/        # PC 侧：ZCode 状态桥接（详见其中的 README）
 └── platformio.ini           # PlatformIO 配置
 ```
 
-## 注意事项
+## 开发
 
-- `data/config.json` 包含认证信息，已被 `.gitignore` 排除，不会上传到仓库
-- 每次修改 `config.json` 后需要重新上传文件系统：`pio run -e esp32-usage-monitor -t uploadfs`
-- WiFi 凭据保存在 NVS 分区，与文件系统相互独立
-- **OpenCode 与 CommandCode 用的是逆向出来的内部接口**（`/console/api/go/status`、
-  `/internal/billing/*`），不是公开 API，对方调整格式后解析可能失效
-- OpenCode 的会话 cookie（`__Host-console_session`）过期后，该页显示"cookie 已过期"；
-  若填的 cookie 里根本没有这个名字，则显示"cookie 缺少 session"
+```bash
+pio run -e esp32-usage-monitor                      # 编译
+pio run -e esp32-usage-monitor -t upload --upload-port COM5
+pio run -e esp32-usage-monitor -t uploadfs --upload-port COM5
+pio device monitor -p COM5 -b 115200                # 串口日志
+```
+
+- **数据源接口**都是逆向来的内部接口（`/console/api/go/status`、`/internal/billing/*`、
+  `platform.deepseek.com/api/v0/*`），对方改格式就可能失效——失效时页面会显示解析失败。
+- **触摸调试**：`platformio.ini` 里打开 `-DTOUCH_DEBUG=1`，串口会打印每次触摸的画布坐标。
+- **串口有缓冲假象**：ESP32-S3 原生 USB CDC 会积压十几秒再成串吐出来，**别据串口静默
+  判断设备卡死**；用网络侧行为（桥接日志、轮询）验证更可靠。
+- 改完 `src/` 要重编译并 `upload`；改完 `data/config.json` 只要 `uploadfs`。
+
+## 安全与隐私
+
+- **`data/config.json` 含凭据，已在 `.gitignore` 里**，不会被提交。仓库里只有
+  `data/config.json.example`（占位符）。
+- 桥接的运行产物也不会被提交：`tools/agent-bridge/*.log`、`devices.json`（设备 IP）、
+  `__pycache__/`。
+- **给设备的是网页登录态凭据**（DeepSeek token、CommandCode/OpenCode 会话 cookie），
+  它们存在板子的文件系统里。设备丢了就等于这些凭据落在别人手里 —— 请把它们当成
+  "一次性、可随时吊销"的东西，丢了就去各家后台重新登录（旧凭据自然失效）。
+- **桥接的 HTTP 接口是局域网明文**（`http://<PC>:8787/agent`），局域网里任何人访问
+  都能看到当前状态、项目名，以及**正在执行的命令**。所以命令里的长串无分隔字符
+  （API key、哈希、base64）在进这个接口**之前**就会被替换成 `…`。
+- hook 只在**本机回环**（`127.0.0.1:8788`）接收事件，不对局域网开放。
+- 不想用发现：`bridge.py --no-discovery`（同时关掉广播应答与主动通告），
+  并在固件里写死 `agent_url`。
 
 ## 友情链接
-- Windows 上的用量显示悬浮窗：[TokenHub](https://github.com/2700zc/TokenHub)，本项目的数据来源与界面参考
+
+- [TokenHub](https://github.com/2700zc/TokenHub)：Windows 上的用量悬浮窗，本项目的数据
+  来源与界面参考
 
 ## License
 

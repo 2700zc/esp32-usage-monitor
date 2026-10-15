@@ -69,6 +69,8 @@ static char     s_agentHost[48] = "";
 static uint16_t s_agentPort     = 8787;
 static char     s_agentPath[40] = "/agent";
 static bool     s_agentFound    = false;  // 当前目标来自发现
+static char     s_agentSaved[48] = "";    // 已写入 NVS 的地址（避免每秒都读一次）
+static uint16_t s_agentSavedPort = 0;
 
 static WiFiUDP  s_agentDisc;
 static bool     s_agentDiscReady = false;
@@ -115,16 +117,29 @@ static void agentSetSweepFromHost() {
 static void agentSeedFromConfig() {
   s_agentHost[0] = 0;
   s_agentFound = false;
-  if (!s_cfg.agent_url[0]) return;
-  if (agParseUrl(s_cfg.agent_url, s_agentHost, sizeof(s_agentHost),
-                 s_agentPort, s_agentPath, sizeof(s_agentPath))) {
-    agentSetSweepFromHost();
-    Serial.printf("agent: seed from config %s:%u%s\n", s_agentHost, (unsigned)s_agentPort,
-                  s_agentPath);
-  } else {
-    Serial.printf("agent: bad agent_url: %s\n", s_cfg.agent_url);
-    s_agentHost[0] = 0;
-    s_agent.lastError = agErrBadUrl;
+  if (s_cfg.agent_url[0]) {
+    if (agParseUrl(s_cfg.agent_url, s_agentHost, sizeof(s_agentHost),
+                   s_agentPort, s_agentPath, sizeof(s_agentPath))) {
+      agentSetSweepFromHost();
+      Serial.printf("agent: seed from config %s:%u%s\n", s_agentHost, (unsigned)s_agentPort,
+                    s_agentPath);
+    } else {
+      Serial.printf("agent: bad agent_url: %s\n", s_cfg.agent_url);
+      s_agentHost[0] = 0;
+      s_agent.lastError = agErrBadUrl;
+    }
+  }
+  // 再压上"上次连上的那台"：重启后照着它直接连回去，不必等桥接的通告
+  // （等通告的代价是屏幕上先写着 45 秒的"没找到桥接"）。
+  char last[48];
+  uint16_t lastPort = 0;
+  if (agLoadLastHost(last, sizeof(last), lastPort)) {
+    strlcpy(s_agentHost, last, sizeof(s_agentHost));
+    s_agentPort = lastPort;
+    Serial.printf("agent: resume last bridge %s:%u\n", s_agentHost, (unsigned)s_agentPort);
+    if (!s_agentSweepNet[0] && !s_agentSweepNet[1] && !s_agentSweepNet[2]) {
+      agentSetSweepFromHost();   // 配置没给种子时，拿上次的地址定扫段范围
+    }
   }
 }
 
@@ -370,6 +385,12 @@ void loop() {
         s_lastAgentPoll = now;
         if (agFetchHost(s_agent, s_agentHost, s_agentPort, s_agentPath)) {
           s_agentFailStreak = 0;
+          // 连上了就记下来：下次重启直接照这个地址连（写 NVS 只在变化时发生）
+          if (strcmp(s_agentHost, s_agentSaved) != 0 || s_agentPort != s_agentSavedPort) {
+            agSaveLastHost(s_agentHost, s_agentPort);
+            strlcpy(s_agentSaved, s_agentHost, sizeof(s_agentSaved));
+            s_agentSavedPort = s_agentPort;
+          }
         } else {
           if (s_agentFailStreak < 6) s_agentFailStreak++;
           // 连不上就把发现重开一遍：PC 换了 IP、或者换了另一台机器

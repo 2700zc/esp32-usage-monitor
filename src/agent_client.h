@@ -24,6 +24,13 @@ extern const char     AGENT_PROBE[];
 // 解析发现应答，取出 HTTP 端口。只认整串前缀，免得把状态推送的 JSON 误判成应答。
 bool agParseReply(const char* buf, int len, uint16_t& httpPort);
 
+// ── 记住最后连上的桥接地址（NVS）──
+// 设备重启后应该从"上次连上的那台 PC"开始试。否则每次重启都要先失败 5 次、
+// 再等桥接的 45 秒通告才恢复，那段时间屏幕上写着"没找到桥接"——用户看到的就是
+// "固件不显示了"。地址只在变化时落盘（NVS 有擦写寿命）。
+bool agLoadLastHost(char* host, size_t hostSz, uint16_t& port);
+void agSaveLastHost(const char* host, uint16_t port);
+
 struct AgentStatus {
   bool     valid;           // 至少成功取到过一次
   uint32_t fetchedAt;       // 最后一次成功更新的 millis
