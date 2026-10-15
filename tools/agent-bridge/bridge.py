@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
 import sys
 import threading
@@ -51,6 +52,32 @@ EVENT_STATE = {
 AGENT_PROBE = b"ZCODE-AGENT-V1?"
 AGENT_REPLY = b"ZCODE-AGENT-V1 %d"
 
+# 设备地址存在桥接旁边，跨重启有效：设备可能记的是别的网络里的桥接地址
+# （换过地方、换过电脑），这时它自己找不到；由记得它的这一侧主动喊一声，
+# 它就会切过来。双向记忆——哪边记得，哪边就负责搭桥。
+STATE_FILE = "devices.json"
+DEVICE_MEMORY = 4          # 记最近几台设备（万一有两块屏）
+ANNOUNCE_IDLE_SEC = 10.0   # 设备多久没来轮询就再喊一次
+ANNOUNCE_POLL_SEC = 5.0    # 多久检查一次"设备还在不在"
+DEVICE_FRESH_SEC = 45.0    # 设备多近来过才算"连着"
+
+
+def load_devices(path) -> list[str]:
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return [str(x) for x in data if isinstance(x, str)][:DEVICE_MEMORY]
+    except Exception:
+        return []
+
+
+def remember_device(path, devices: list[str], ip: str) -> list[str]:
+    """把 ip 提到最前面；发生变化时返回新列表（调用方负责落盘）。"""
+    if devices and devices[0] == ip:
+        return devices
+    devices = [ip] + [d for d in devices if d != ip]
+    return devices[:DEVICE_MEMORY]
+
 class Bridge:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -61,6 +88,10 @@ class Bridge:
         self.device_seen = 0.0
         self.last_push_seq = -1
         self.udp_out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.state_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), STATE_FILE)
+        self.known_devices = load_devices(self.state_path)
+        if self.known_devices:
+            print(f"remembered device(s): {', '.join(self.known_devices)}", flush=True)
 
     # ── ingress ──
     def ingest(self, payload: bytes) -> None:
@@ -206,6 +237,41 @@ class Bridge:
                 print(f"  device at {ip} (udp push -> :{self.args.udp_port})", flush=True)
             self.device_ip = ip
             self.device_seen = time.time()
+            new = remember_device(self.state_path, self.known_devices, ip)
+            if new is not self.known_devices:
+                self.known_devices = new
+                try:
+                    with open(self.state_path, "w", encoding="utf-8") as f:
+                        json.dump(new, f, ensure_ascii=False)
+                except OSError as e:
+                    print(f"  !! cannot save {self.state_path}: {e}", flush=True)
+
+    def announcer(self) -> None:
+        """设备不来轮询时，主动朝记得的地址喊一声"桥接在这儿"。
+
+        设备侧只需要收到这条报文就会切换过去（它不用先发问），所以这招能救回
+        "设备里存的是另一个网络的地址"这种自己永远找不到的情况——实测有效。
+        """
+        out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        last_announce = 0.0
+        while True:
+            time.sleep(ANNOUNCE_POLL_SEC)
+            with self.lock:
+                targets = list(self.known_devices)
+                fresh = time.time() - self.device_seen < DEVICE_FRESH_SEC
+            if not targets or fresh:
+                last_announce = 0.0
+                continue
+            if time.time() - last_announce < ANNOUNCE_IDLE_SEC:
+                continue
+            last_announce = time.time()
+            pkt = AGENT_REPLY % self.args.http_port
+            for ip in targets:
+                try:
+                    out.sendto(pkt, (ip, self.args.discovery_port))
+                    print(f"  announce -> {ip}:{self.args.discovery_port}", flush=True)
+                except OSError:
+                    pass
 
     def udp_listener(self, sock: socket.socket) -> None:
         print(f"hook ingress  udp 127.0.0.1:{self.args.hook_port}", flush=True)
@@ -235,6 +301,26 @@ class Bridge:
                 print(f"  discovery reply -> {addr[0]}:{addr[1]}", flush=True)
             except OSError as e:
                 print(f"  !! discovery reply to {addr} failed: {e}", flush=True)
+
+
+class _StampWriter:
+    """给每一行输出加 HH:MM:SS。
+
+    排查"设备多久才被找回""事件是不是漏了一拍"这类问题时，没有时间戳的日志
+    基本没用——每次都要靠外部时间反推。包一层省得在几十处 print 里手工加。
+    """
+    def __init__(self, raw):
+        self._raw = raw
+
+    def write(self, s: str) -> None:
+        self._raw.write((time.strftime("%H:%M:%S ") + s) if s.strip() else s)
+
+    def flush(self) -> None:
+        self._raw.flush()
+
+    def reconfigure(self, **kw) -> None:
+        if hasattr(self._raw, "reconfigure"):
+            self._raw.reconfigure(**kw)
 
 
 class Server(ThreadingHTTPServer):
@@ -308,6 +394,11 @@ def main() -> int:
     ap.add_argument("--no-discovery", action="store_true",
                     help="do not answer discovery probes; the device must be "
                          "given this address in agent_url")
+    ap.add_argument("--announce-to", action="append", default=[], metavar="IP",
+                    help="announce to this device IP (repeatable). Only needed the "
+                         "first time at a new site: the device may be holding another "
+                         "network's bridge address and would never come to poll here, "
+                         "so this side has to speak first. Remembered afterwards.")
     ap.add_argument("--no-push", action="store_true",
                     help="poll only; disable the instant UDP push to the device")
     args = ap.parse_args()
@@ -318,11 +409,26 @@ def main() -> int:
         sys.stdout.reconfigure(line_buffering=True)
     except Exception:
         pass
+    sys.stdout = _StampWriter(sys.stdout)
 
     if args.no_push:
         args.udp_port = 0
 
     bridge = Bridge(args)
+
+    # 命令行指定的设备地址并进记忆：这是"设备存着别的网络的桥接地址、自己永远
+    # 找不到这里"时的引导办法（设备不会来轮询，桥接也就无从知道它在哪）
+    for ip in args.announce_to:
+        new = remember_device(bridge.state_path, bridge.known_devices, ip)
+        if new is not bridge.known_devices:
+            bridge.known_devices = new
+            print(f"announce target added: {ip}", flush=True)
+    if args.announce_to:
+        try:
+            with open(bridge.state_path, "w", encoding="utf-8") as f:
+                json.dump(bridge.known_devices, f, ensure_ascii=False)
+        except OSError as e:
+            print(f"cannot save {bridge.state_path}: {e}", file=sys.stderr, flush=True)
 
     # hook 入口先绑定：绑不上就说明已经有实例在跑，直接退出。绝不能落到
     # "HTTP 端口绑上了、事件收不到"的半死状态——那种状态下设备一切正常，
@@ -351,6 +457,8 @@ def main() -> int:
         if disc is not None:
             threading.Thread(target=bridge.discovery_listener, args=(disc,),
                              daemon=True).start()
+            # 设备自己找不到桥接时（它记的是别的网络的地址），由这一侧主动喊
+            threading.Thread(target=bridge.announcer, daemon=True).start()
 
     ip = lan_ip()
     print(f"ZCode agent bridge up")
