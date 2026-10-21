@@ -1,7 +1,7 @@
 #pragma once
 #include <Arduino.h>
 
-// ZCode 的实时状态。状态由 PC 上的桥接进程维护（tools/agent-bridge/bridge.py）：
+// Agent 的实时状态（页面不绑定具体 agent）。状态由 PC 上的桥接进程维护（tools/agent-bridge/bridge.py）：
 // 固件每秒轮询一次，桥接从轮询请求的源地址学到设备位置后，还会在状态变化的
 // 瞬间直接 UDP 推一份过来。两条路送的是同一份 JSON，所以解析只有一份。
 enum AgentErr : uint8_t {

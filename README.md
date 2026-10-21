@@ -1,17 +1,17 @@
 # ESP32-S3 AI 用量监视器
 
 一块放在桌上的小屏幕，抬眼就能看到两件事：**你的 AI 编程服务还剩多少额度**，以及
-**ZCode 此刻在干什么**（正在思考 / 执行工具 / 等待授权 / 思考完成）。左右滑动切页。
+**你的 Agent 此刻在干什么**（正在思考 / 执行工具 / 等待授权 / 思考完成）。左右滑动切页。
 
 硬件是 Waveshare ESP32-S3-Touch-AMOLED-2.16（480×480 AMOLED + 触摸），固件用
 PlatformIO + Arduino 框架，配置放在板子的文件系统里，凭据不经过任何第三方服务器。
 
 ```
 ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
-│ ● ZCode     14:32│  │ ● OpenCode Go    │  │ ● CommandCode    │  │ ● DeepSeek       │
-│   Agent 状态·3秒前│  │   用量窗口·刚刚   │  │   用量窗口·刚刚   │  │   今日用量·刚刚   │
+│ ● Agent     14:32│  │ ● OpenCode Go    │  │ ● CommandCode    │  │ ● DeepSeek       │
+│   状态·3秒前      │  │   用量窗口·刚刚   │  │   用量窗口·刚刚   │  │   今日用量·刚刚   │
 │ ┌──────────────┐ │  │ ┌──────────────┐ │  │ ┌──────────────┐ │  │ ┌──────────────┐ │
-│ │ ZCode 状态 1个│ │  │ │ 滚动用量  2时  │ │  │ │ 滚动用量  3时  │ │  │ │ 今日请求数    │ │
+│ │ 当前状态   1个│ │  │ │ 滚动用量  2时  │ │  │ │ 滚动用量  3时  │ │  │ │ 今日请求数    │ │
 │ │ 正在思考     │ │  │ │ 0.54%        │ │  │ │ 3.01%        │ │  │ │ 128 次       │ │
 │ └──────────────┘ │  │ └──────────────┘ │  │ └──────────────┘ │  │ └──────────────┘ │
 │ ┌──────────────┐ │  │ ┌──────────────┐ │  │ ┌──────────────┐ │  │ ┌──────────────┐ │
@@ -43,8 +43,8 @@ PlatformIO + Arduino 框架，配置放在板子的文件系统里，凭据不�
 
 ## 功能一览
 
-- **四页滑动切换**，顺序：ZCode 状态 → OpenCode Go → CommandCode → DeepSeek
-  - **ZCode 状态**：正在思考 / 执行工具 / 等待授权 / 思考完成 / 空闲；第二行是工具名，
+- **四页滑动切换**，顺序：Agent 状态 → OpenCode Go → CommandCode → DeepSeek
+  - **Agent 状态**：正在思考 / 执行工具 / 等待授权 / 思考完成 / 空闲；第二行是工具名，
     第三行是**它此刻在做什么**（Bash 的执行命令、Edit 的文件名），不在执行时显示会话
     所属的项目名。状态变化在**亚秒级**推到屏幕上
   - **OpenCode Go / CommandCode**：滚动 / 每周 / 每月用量（百分比 + 距重置倒计时），
@@ -58,7 +58,7 @@ PlatformIO + Arduino 框架，配置放在板子的文件系统里，凭据不�
 - 深色 AMOLED 界面：纯黑背景 + 深灰圆角卡片 + 各家品牌色
 - 刷新失败**不会清空页面**：继续显示上一次的数据，页头用琥珀色标出失败原因与数据年龄
 
-只配了其中一家的凭据时，就只有那一页 + ZCode 状态页（ZCode 页始终存在，见下）。
+只配了其中一家的凭据时，就只有那一页 + Agent 状态页（Agent 页始终存在，见下）。
 
 ## 硬件需求
 
@@ -150,7 +150,7 @@ pio run -e esp32-usage-monitor -t uploadfs --upload-port COM5
 | `oc_api_key` | OpenCode Go（推荐，长期有效） | 见下（可改用 cookie 方式） |
 | `oc_workspace_id` + `oc_cookie` | OpenCode Go 的备选（浏览器会话） | 不显示 OpenCode Go 页 |
 | `cc_cookie` | CommandCode 用量 | 不显示 CommandCode 页 |
-| `agent_url` | ZCode 状态页的桥接地址（**可选**，只是个种子） | 靠自动发现找桥接 |
+| `agent_url` | Agent 状态页的桥接地址（**可选**，只是个种子） | 靠自动发现找桥接 |
 
 ### DeepSeek：`ds_token`
 
@@ -182,7 +182,7 @@ pio run -e esp32-usage-monitor -t uploadfs --upload-port COM5
 `__Secure-commandcode_prod_.session_token`，复制它的**值**（不带 cookie 名）。
 浏览器复制出来是 URL 编码的（含 `%2F`、`%3D`），原样填入即可。
 
-### ZCode 状态：`agent_url`
+### Agent 状态：`agent_url`
 
 **可以留空**——板子会在局域网里自己找桥接。想填就填桥接启动时打印的那一行，好处是
 开机第一次就直连成功、不用等发现过程。详见下一节。
@@ -355,7 +355,7 @@ FreeRTOS 任务**里，UI 循环只做触摸采样和绘制，从不等待网络
 ├── src/
 │   ├── main.cpp             # 主循环 + 两个 core 0 网络任务（用量抓取 / Agent 状态）
 │   ├── http_client.cpp/h    # HTTPS / 明文 HTTP GET（共用精确读正文的核心）
-│   ├── agent_client.cpp/h   # ZCode 状态：轮询、推送解析、局域网发现、地址记忆
+│   ├── agent_client.cpp/h   # Agent 状态：轮询、推送解析、局域网发现、地址记忆
 │   ├── deepseek_client.cpp/h    # DeepSeek 用量/余额
 │   ├── opencode_client.cpp/h    # OpenCode Go
 │   ├── commandcode_client.cpp/h # CommandCode
@@ -366,7 +366,7 @@ FreeRTOS 任务**里，UI 循环只做触摸采样和绘制，从不等待网络
 │   ├── config.h             # 配置结构体 + 加载
 │   └── hw/                  # 硬件层：显示 / 输入 / 手势 / 自动旋转 / 电源 / IMU / RTC / 扩展器
 ├── tools/
-│   └── agent-bridge/        # PC 侧：ZCode 状态桥接（详见其中的 README）
+│   └── agent-bridge/        # PC 侧：Agent 状态桥接（详见其中的 README）
 └── platformio.ini           # PlatformIO 配置
 ```
 

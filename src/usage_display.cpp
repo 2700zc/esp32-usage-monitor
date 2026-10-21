@@ -21,7 +21,7 @@ static const uint16_t COL_DOT_OFF = 0x52AA;  // #555555 未选中的页码点
 // TokenHub 里三个服务商的强调色，转 RGB565
 static const uint16_t COL_OC      = 0x1BBA;  // #1976d2 OpenCode Go
 static const uint16_t COL_CC      = 0x044F;  // #00897b CommandCode
-static const uint16_t COL_AGENT   = 0x8AFE;  // #8B5CF6 ZCode 状态页
+static const uint16_t COL_AGENT   = 0x8AFE;  // #8B5CF6 Agent 状态页
 static const uint16_t COL_GREEN   = 0x2E6E;  // #2ECC71 思考完成
 
 // 画布 184×224（2× 放大到物理 480×480）；边距 4 = 物理 8px，卡片几乎铺满
@@ -446,7 +446,7 @@ void usageDisplayDrawDs(const DeepSeekUsage& data, const char* ip, int page, int
   drawStatusBar(ip);
 }
 
-// ── ZCode Agent 状态页 ──
+// ── Agent 状态页 ──
 
 // 状态 -> 文案。桥接以后加了新状态（或字段缺失）就原样显示，不猜。
 static const char* agentStateLabel(const char* state, char* buf, size_t sz) {
@@ -539,15 +539,15 @@ void usageDisplayDrawAgent(const AgentStatus& data, const char* ip, int page, in
       tcol  = reason ? COL_RED : COL_TEXT2;
       sub   = reason ? reason : "等待首次刷新";
     }
-    drawHeader("ZCode", COL_AGENT, "Agent 状态", COL_TEXT2);
+    drawHeader("Agent", COL_AGENT, "状态", COL_TEXT2);
     drawStatusBody(title, tcol, sub, data.lastDetail, ip, page, pageCount, hint);
     return;
   }
 
   char sub[48], age[16];
   formatAgeShort(age, sizeof(age), data.ageSec);
-  snprintf(sub, sizeof(sub), "Agent 状态 · %s", age);
-  drawHeaderStatus("ZCode", COL_AGENT, sub, reason, data.fetchedAt);
+  snprintf(sub, sizeof(sub), "状态 · %s", age);
+  drawHeaderStatus("Agent", COL_AGENT, sub, reason, data.fetchedAt);
 
   // 卡片 1：状态本体。会话数只在多于一个时出现（同时开两个窗口才有意义）
   char label[16];
@@ -557,7 +557,7 @@ void usageDisplayDrawAgent(const AgentStatus& data, const char* ip, int page, in
   char sessions[20];
   sessions[0] = 0;
   if (data.activeSessions > 1) snprintf(sessions, sizeof(sessions), "%u 个会话", data.activeSessions);
-  drawCardRow1(CARD_Y[0], "ZCode 状态", sessions);
+  drawCardRow1(CARD_Y[0], "当前状态", sessions);
 
   // 卡片 2：正在执行的工具。右侧标出这一份是 UDP 推来的还是轮询取的——
   // 两条链路出问题时这是最快的区分办法。

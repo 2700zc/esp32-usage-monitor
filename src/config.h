@@ -12,7 +12,7 @@ struct AppConfig {
                              // 而 session 通常排在末尾（偏移 644），缓冲区贴着长度
                              // 就会把 session 截断成"看似配好、请求必 401"的状态
   char cc_cookie[160];       // CommandCode 会话 token（只填 cookie 的值，不含 cookie 名）
-  char agent_url[96];        // ZCode 状态桥接地址，形如 http://192.168.1.10:8787/agent
+  char agent_url[96];        // Agent 状态桥接地址，形如 http://192.168.1.10:8787/agent
                              // （PC 上跑 tools/agent-bridge/bridge.py，启动时会打印
                              // 这一行，直接粘过来即可）
   bool valid;                // 至少配置了一个服务商

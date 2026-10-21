@@ -28,7 +28,7 @@ static const uint32_t REFRESH_ROUND_MS   = 60000;
 static const uint32_t USAGE_FETCH_GAP_MS = 500;
 static const uint32_t CONNECT_TIMEOUT_MS = 10000;  // 自动连接 10 秒超时
 
-// ZCode 状态页的节奏与上面那轮无关：用量一分钟一变，状态一秒一变。局域网里的
+// Agent 状态页的节奏与上面那轮无关：用量一分钟一变，状态一秒一变。局域网里的
 // 小请求只要几十毫秒；桥接不在时它最多阻塞 1.2 秒，但阻塞的是后台任务。
 static const uint32_t AGENT_POLL_MS     = 1000;
 static const uint32_t AGENT_POLL_MAX_MS = 30000;  // 桥接不在时最长退避到这个间隔
@@ -69,7 +69,7 @@ static volatile bool     s_cmdAgentNow = false;
 static volatile bool     s_cmdProbeNow = false;
 static volatile uint32_t s_netGen      = 0;   // 每次连上 WiFi +1，任务据此重绑 UDP
 
-// 页面顺序：ZCode 状态在最前，其余三家与 TokenHub 一致（OpenCode Go →
+// 页面顺序：Agent 状态在最前，其余三家与 TokenHub 一致（OpenCode Go →
 // CommandCode → DeepSeek）。没配齐凭据的服务商不生成页面（只配了 DeepSeek
 // 就仍是单页，滑动无效果）。
 enum class Prov : uint8_t { Agent, Oc, Cc, Ds };
@@ -173,7 +173,7 @@ static bool syncSharedData() {
   return onAgent ? agentChanged : usageChanged;
 }
 
-// ── ZCode 状态：目标地址与局域网发现 ──
+// ── Agent 状态：目标地址与局域网发现 ──
 
 // "a.b.c.d" -> 记住它的 /24，供扫段用
 static void agentSetSweepFromHost() {
