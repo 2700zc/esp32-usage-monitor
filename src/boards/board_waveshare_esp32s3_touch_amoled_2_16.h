@@ -57,6 +57,9 @@
 #define BOARD_DISPLAY_CO5300       1
 #define BOARD_CO5300_COL_OFFSET    0   // 480×480 panel uses full window; 1.75c sets 6 (round panel)
 #define BOARD_DISPLAY_ROTATION     0
+// 方形 480×480 屏 + QMI8658：支持运行时改 MADCTL 做四向旋转。内容整体旋转，
+// 画布仍保持 184×224，不重排布局。
+#define BOARD_HAS_AUTO_ROTATE      1
 // MADCTL override: Arduino_CO5300's setRotation only does X/Y mirror, not
 // row/column swap (MV bit). Setting this to non-zero writes 0x36 directly
 // after canvas->begin(). 0x60 = MV+MX (90° CW); 0xA0 = MV+MY (90° CCW); 0 = no override.

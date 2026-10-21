@@ -51,6 +51,8 @@ PlatformIO + Arduino 框架，配置放在板子的文件系统里，凭据不�
   - **DeepSeek**：今日请求数、今日 Tokens（千分位）、账户余额（低于 5 元变红）
 - 用量**每 60 秒**刷新一轮；**PWR 键**随时手动刷新
 - **左右滑动**切页，到底循环，底部圆点指示当前位置
+- **屏幕随重力自动旋转**：竖放 / 横放 / 倒置时界面自动保持正立；平放在桌面上原地
+  转 90° 由陀螺仪识别。2.16 是方形屏，旋转只改扫描方向，不重排、不拉伸布局
 - **WiFi 配置界面直接做在屏幕上**（扫描 + 软键盘输密码），配好之后开机自动连接
 - 深色 AMOLED 界面：纯黑背景 + 深灰圆角卡片 + 各家品牌色
 - 刷新失败**不会清空页面**：继续显示上一次的数据，页头用琥珀色标出失败原因与数据年龄
@@ -63,6 +65,7 @@ PlatformIO + Arduino 框架，配置放在板子的文件系统里，凭据不�
 |---|---|
 | 开发板 | Waveshare **ESP32-S3-Touch-AMOLED-2.16**（ESP32-S3R8 / 16MB Flash / 8MB OPI PSRAM） |
 | 屏幕 | 480×480 AMOLED（CO5300），电容触摸（CST9220） |
+| IMU | 板载 QMI8658A（加速度计 + 陀螺仪），用于屏幕自动旋转 |
 | 数据线 | USB-C，**要能传数据**（不少线只能供电，插上找不到串口就是这类） |
 | 网络 | 2.4GHz WiFi，且与跑桥接的电脑互通（见[换电脑 / 换网络](#换电脑--换网络)） |
 | 电脑 | Windows（脚本按 Windows 写的；固件本身跨平台） |
@@ -282,8 +285,13 @@ ZCode agent bridge up
 | **BOOT（右键）** | 重新进入 WiFi 配置界面 |
 | 断电重开 | 自动连 WiFi，并从上次那台 PC 恢复状态页 |
 
-用量每 60 秒刷新一轮，四家**分摊到连续的多帧**里做，每帧只抓一个：最长无响应时间
-约等于单个服务商（1~1.5 秒），而不是四家之和，所以滑动始终跟手。
+用量每 60 秒刷新一轮：Agent 状态轮询和三家用量抓取各跑在一个 **core 0 的后台
+FreeRTOS 任务**里，UI 循环只做触摸采样和绘制，从不等待网络。所以 TLS 握手、接
+口超时、桥接不在都不会再让滑动或画面卡住。
+
+主循环也不会每帧重画：翻页/数据更新/网络状态变化时立即画，其余按 1 秒（状态页）
+或 10 秒（用量页）兜底刷新。空闲时循环只有几毫秒，触摸采样约 100 Hz；滑动在位移
+越过阈值的那一帧就切页，不等抬手。
 
 ## 换电脑 / 换网络
 
@@ -322,7 +330,9 @@ ZCode agent bridge up
 | 桥接日志里没有事件 | hook 没装 / ZCode 没重启；看 `tools/agent-bridge/hook-errors.log` |
 | 桥接启动报 `cannot bind udp` | 已经有一个实例在跑，先杀掉旧的（两个实例会让事件只投给其中一个） |
 | 状态停在某个值不动 | 那个会话退出了但没发 `Stop`（子智能体就这样）——等 2 分钟会自动降级 |
-| 触摸方向不对 | `src/hw/gesture.cpp` 末尾两个分支对调（屏幕旋转 90°，判定用的是 y 位移） |
+| 屏幕方向不跟手 | 看串口 `rot:` 日志：倾斜时以重力为准，平放时以陀螺仪为准；平放没有绝对方位，把设备竖起一下再放平即可重新定方向 |
+| 旋转 90° 后界面上下颠倒 | `src/hw/display.cpp` 的 `ROT_MADCTL` 表里 `R90` / `R270` 两项对调 |
+| 触摸左右滑方向反了 | `src/hw/gesture.cpp` 里对应旋转角的 `next` 条件取反 |
 
 桥接自己的排查表更细，见 [`tools/agent-bridge/README.md`](tools/agent-bridge/README.md)。
 
@@ -333,7 +343,7 @@ ZCode agent bridge up
 │   ├── config.json          # 运行时配置（含凭据，已 gitignore）
 │   └── config.json.example  # 配置模板
 ├── src/
-│   ├── main.cpp             # 主循环：WiFi 状态机 + 页面状态 + 刷新调度 + 状态发现
+│   ├── main.cpp             # 主循环 + 两个 core 0 网络任务（用量抓取 / Agent 状态）
 │   ├── http_client.cpp/h    # HTTPS / 明文 HTTP GET（共用精确读正文的核心）
 │   ├── agent_client.cpp/h   # ZCode 状态：轮询、推送解析、局域网发现、地址记忆
 │   ├── deepseek_client.cpp/h    # DeepSeek 用量/余额
@@ -344,7 +354,7 @@ ZCode agent bridge up
 │   ├── usage_display.cpp/h  # 四个页面的绘制
 │   ├── wifi_config.cpp/h    # WiFi 配置界面（扫描 + 软键盘）
 │   ├── config.h             # 配置结构体 + 加载
-│   └── hw/                  # 硬件层：显示 / 输入 / 手势 / 电源 / IMU / RTC / 扩展器
+│   └── hw/                  # 硬件层：显示 / 输入 / 手势 / 自动旋转 / 电源 / IMU / RTC / 扩展器
 ├── tools/
 │   └── agent-bridge/        # PC 侧：ZCode 状态桥接（详见其中的 README）
 └── platformio.ini           # PlatformIO 配置

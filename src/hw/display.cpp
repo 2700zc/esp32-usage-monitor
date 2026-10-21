@@ -9,8 +9,20 @@ static Arduino_CO5300*   s_gfx    = nullptr;
 static Arduino_SH8601*   s_gfx    = nullptr;
 #endif
 static Arduino_Canvas*   s_canvas = nullptr;
+static ScreenRot         s_rot    = ScreenRot::R0;
 
 static const uint8_t BRIGHT_LUT[5] = { 50, 100, 150, 200, 255 };
+
+#if BOARD_HAS_AUTO_ROTATE
+// 内容旋转角 → MADCTL。基线 0xA0 (MV+MY) 是当前竖屏，板级注释里明确：
+// 0x60 = MV+MX 是 90° CW，0xA0 = MV+MY 是 90° CCW。因此在 0xA0 基础上：
+//   0x00 = 顺时针 90°（= 从 native 0x00 起算的 0°，相对 0xA0 是 90° CW）
+//   0x60 = 180°
+//   0xC0 = 逆时针 90°
+// 若实测两个侧向方向上下颠倒，交换 R90/R270 这两项即可。
+static const uint8_t ROT_MADCTL[4] = { 0xA0, 0x00, 0x60, 0xC0 };
+static_assert(BOARD_CO5300_MADCTL == 0xA0, "ROT_MADCTL table assumes 0xA0 baseline");
+#endif
 
 #if BOARD_DISPLAY_SH8601_VENDOR_INIT
 // LVGL demo SH8601 init for the 2.16 panel revision.
@@ -92,6 +104,22 @@ bool hwDisplayInit() {
 
 Arduino_Canvas* hwCanvas() { return s_canvas; }
 
+ScreenRot hwDisplayGetRotation() { return s_rot; }
+
+void hwDisplaySetRotation(ScreenRot r) {
+#if BOARD_HAS_AUTO_ROTATE
+  if (r == s_rot || !s_bus) return;
+  // 改扫描方向，不改画布/帧缓冲。下一帧仍是完整的 480×480 blit，地址窗口
+  // 会由 draw16bitRGBBitmap 重新设置，所以这里只写 MADCTL。
+  s_bus->beginWrite();
+  s_bus->writeC8D8(0x36, ROT_MADCTL[(uint8_t)r]);
+  s_bus->endWrite();
+  s_rot = r;
+#else
+  (void)r;
+#endif
+}
+
 void hwDisplayBrightness(uint8_t lvl) {
   if (lvl > 4) lvl = 4;
   s_gfx->setBrightness(BRIGHT_LUT[lvl]);
@@ -148,38 +176,54 @@ void hwDisplayPush() {
   constexpr uint32_t SCALE_X = ((uint32_t)HW_W << 16) / DEST_W;
   constexpr uint32_t SCALE_Y = ((uint32_t)HW_H << 16) / DEST_H;
 
-  for (int dy = 0; dy < DEST_H; dy++) {
-    uint32_t sy_fp = (uint32_t)dy * SCALE_Y;
-    int y0 = sy_fp >> 16;
-    int y1 = (y0 + 1 < HW_H) ? y0 + 1 : y0;
-    uint32_t fy = (sy_fp >> 11) & 0x1F;
-    uint32_t inv_fy = 32 - fy;
+  if (DEST_W == HW_W * 2 && DEST_H == HW_H * 2) {
+    // 2× 整数放大的快路径：每个源像素横向复制两次、整行再复制一次。通用双线性
+    // 循环在这组参数下 fx/fy 恒为 0，结果完全相同，但每像素多花十几次乘加；
+    // 这里把每帧几十毫秒的 CPU 时间省下来，主循环才有余量及时采样触摸。
+    for (int sy = 0; sy < HW_H; sy++) {
+      const uint16_t* srow = src + sy * HW_W;
+      uint16_t* drow = s_frameBuf + (OFF_Y + sy * 2) * LCD_W_PHYS + OFF_X;
+      for (int sx = 0; sx < HW_W; sx++) {
+        uint16_t c = srow[sx];
+        drow[sx * 2]     = c;
+        drow[sx * 2 + 1] = c;
+      }
+      memcpy(drow + LCD_W_PHYS, drow, DEST_W * sizeof(uint16_t));
+    }
+  } else {
+    for (int dy = 0; dy < DEST_H; dy++) {
+      uint32_t sy_fp = (uint32_t)dy * SCALE_Y;
+      int y0 = sy_fp >> 16;
+      int y1 = (y0 + 1 < HW_H) ? y0 + 1 : y0;
+      uint32_t fy = (sy_fp >> 11) & 0x1F;
+      uint32_t inv_fy = 32 - fy;
 
-    uint16_t* row0 = src + y0 * HW_W;
-    uint16_t* row1 = src + y1 * HW_W;
-    uint16_t* dstRow = s_frameBuf + (dy + OFF_Y) * LCD_W_PHYS + OFF_X;
+      uint16_t* row0 = src + y0 * HW_W;
+      uint16_t* row1 = src + y1 * HW_W;
+      uint16_t* dstRow = s_frameBuf + (dy + OFF_Y) * LCD_W_PHYS + OFF_X;
 
-    for (int dx = 0; dx < DEST_W; dx++) {
-      uint32_t sx_fp = (uint32_t)dx * SCALE_X;
-      int x0 = sx_fp >> 16;
-      int x1 = (x0 + 1 < HW_W) ? x0 + 1 : x0;
-      uint32_t fx = (sx_fp >> 11) & 0x1F;
-      uint32_t inv_fx = 32 - fx;
+      for (int dx = 0; dx < DEST_W; dx++) {
+        uint32_t sx_fp = (uint32_t)dx * SCALE_X;
+        int x0 = sx_fp >> 16;
+        int x1 = (x0 + 1 < HW_W) ? x0 + 1 : x0;
+        uint32_t fx = (sx_fp >> 11) & 0x1F;
+        uint32_t inv_fx = 32 - fx;
 
-      uint16_t p00 = row0[x0];
-      uint16_t p01 = row0[x1];
-      uint16_t p10 = row1[x0];
-      uint16_t p11 = row1[x1];
+        uint16_t p00 = row0[x0];
+        uint16_t p01 = row0[x1];
+        uint16_t p10 = row1[x0];
+        uint16_t p11 = row1[x1];
 
-      uint32_t t_rb = (p00 & 0xF81F) * inv_fx + (p01 & 0xF81F) * fx;
-      uint32_t t_g  = (p00 & 0x07E0) * inv_fx + (p01 & 0x07E0) * fx;
-      uint32_t b_rb = (p10 & 0xF81F) * inv_fx + (p11 & 0xF81F) * fx;
-      uint32_t b_g  = (p10 & 0x07E0) * inv_fx + (p11 & 0x07E0) * fx;
+        uint32_t t_rb = (p00 & 0xF81F) * inv_fx + (p01 & 0xF81F) * fx;
+        uint32_t t_g  = (p00 & 0x07E0) * inv_fx + (p01 & 0x07E0) * fx;
+        uint32_t b_rb = (p10 & 0xF81F) * inv_fx + (p11 & 0xF81F) * fx;
+        uint32_t b_g  = (p10 & 0x07E0) * inv_fx + (p11 & 0x07E0) * fx;
 
-      uint32_t rb = (t_rb * inv_fy + b_rb * fy) >> 10;
-      uint32_t g  = (t_g  * inv_fy + b_g  * fy) >> 10;
+        uint32_t rb = (t_rb * inv_fy + b_rb * fy) >> 10;
+        uint32_t g  = (t_g  * inv_fy + b_g  * fy) >> 10;
 
-      dstRow[dx] = (uint16_t)((rb & 0xF81F) | (g & 0x07E0));
+        dstRow[dx] = (uint16_t)((rb & 0xF81F) | (g & 0x07E0));
+      }
     }
   }
   s_gfx->draw16bitRGBBitmap(0, 0, s_frameBuf, LCD_W_PHYS, LCD_H_PHYS);

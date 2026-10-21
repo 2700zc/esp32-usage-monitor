@@ -3,6 +3,7 @@
 #include "hw/input.h"
 #include "hw/power.h"
 #include "hw/imu.h"
+#include "hw/rotation.h"
 #include "hw/rtc.h"
 #include "hw/border.h"
 #include "hw/expander.h"

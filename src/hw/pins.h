@@ -12,3 +12,8 @@
 #else
   #error "No board defined. Add -DBOARD_WAVESHARE_ESP32S3_TOUCH_AMOLED_1_8, _1_75C, _ESP32C6_TOUCH_AMOLED_2_16, or _ESP32S3_TOUCH_AMOLED_2_16 to build_flags in platformio.ini."
 #endif
+
+// 自动旋转是 2.16 方形屏特有的能力，其他板型默认关闭（矩形/圆形屏旋转会改变布局）
+#ifndef BOARD_HAS_AUTO_ROTATE
+  #define BOARD_HAS_AUTO_ROTATE 0
+#endif

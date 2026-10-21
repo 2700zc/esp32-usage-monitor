@@ -118,23 +118,39 @@ static void scanAxp() {
 }
 #endif
 
+// 触摸采样节奏与抬起去抖。
+//
+// 这两个常量针对「滑动有时候失灵」：
+//   - 不能只在 IRQ 边沿采样。主循环偶尔有几帧比较慢（整屏推送），正好落在
+//     这段时间里的一次快速滑动会连按下带抬起一起错过。空闲时按
+//     TOUCH_IDLE_POLL_MS 轮询，IRQ 下降沿仍会把这次轮询提前，不增加手感延迟。
+//   - 不能把一次空读当成抬起。CST92xx/FT3168 的读点会偶发返回空（I2C 抖动，
+//     或正好读在两次上报之间）；旧逻辑一旦空读就结束手势并停止轮询，而手指
+//     没离开屏幕就不会再产生下降沿——只能抬手重按，表现就是「滑不动」。
+//     连续 TOUCH_RELEASE_MS 都没有点才结算抬起。滑动在越过阈值时就已经切页
+//     （见 gesture.cpp），这点抬手延迟看不出来。
+static const uint32_t TOUCH_RELEASE_MS   = 40;
+static const uint32_t TOUCH_IDLE_POLL_MS = 10;
+static uint32_t s_lastPointMs = 0;
+static uint32_t s_lastPollMs  = 0;
+
 static void scanTouch() {
-  // Poll when IRQ fires OR when a finger was down last frame — both FT3168
-  // and CST92xx only reliably IRQ on state edges, so a drag wouldn't advance
-  // x/y without this.
-  bool shouldPoll = s_tpIrqFlag || s_tp.down;
+  uint32_t now = millis();
+  bool irq = s_tpIrqFlag;
   s_tpIrqFlag = false;
 
-  if (!shouldPoll) {
+  if (!s_tp.down && !irq && now - s_lastPollMs < TOUCH_IDLE_POLL_MS) {
     s_tp.justPressed  = false;
     s_tp.justReleased = false;
     return;
   }
+  s_lastPollMs = now;
 
 #if BOARD_TOUCH_CST92XX
   int16_t x[2] = {0}, y[2] = {0};
   uint8_t n = s_cst.getPoint(x, y, s_cst.getSupportTouchPoint());
   if (n > 0) {
+    s_lastPointMs = now;
     s_tp.justPressed  = !s_tp.down;
     s_tp.justReleased = false;
     // Mirror of hwDisplayPush's letterbox scale: reverse (physical → canvas).
@@ -165,9 +181,17 @@ static void scanTouch() {
     #endif
     s_tp.down = true;
   } else {
-    s_tp.justReleased = s_tp.down;
-    s_tp.down = false;
-    s_tp.justPressed  = false;
+    s_tp.justPressed = false;
+    if (s_tp.down) {
+      if (now - s_lastPointMs >= TOUCH_RELEASE_MS) {
+        s_tp.down = false;
+        s_tp.justReleased = true;
+      } else {
+        s_tp.justReleased = false;   // 去抖窗口内：保留上一帧坐标，手势继续
+      }
+    } else {
+      s_tp.justReleased = false;
+    }
   }
 #else
   uint8_t fingers = (uint8_t)s_ft3168->IIC_Read_Device_Value(
@@ -177,6 +201,7 @@ static void scanTouch() {
         Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X);
     int ry = (int)s_ft3168->IIC_Read_Device_Value(
         Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
+    s_lastPointMs = now;
     s_tp.justPressed  = !s_tp.down;
     s_tp.justReleased = false;
     int dx = rx - BOARD_DISPLAY_OFFSET_X;
@@ -189,9 +214,17 @@ static void scanTouch() {
     s_tp.y = ty;
     s_tp.down = true;
   } else {
-    s_tp.justReleased = s_tp.down;
-    s_tp.down = false;
-    s_tp.justPressed  = false;
+    s_tp.justPressed = false;
+    if (s_tp.down) {
+      if (now - s_lastPointMs >= TOUCH_RELEASE_MS) {
+        s_tp.down = false;
+        s_tp.justReleased = true;
+      } else {
+        s_tp.justReleased = false;
+      }
+    } else {
+      s_tp.justReleased = false;
+    }
   }
 #endif
 }

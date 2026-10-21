@@ -34,6 +34,9 @@ void hwInit() {
 #endif
   if (!hwInputInit())      die("input");
   if (!hwImuInit())        die("imu");
+  // 读一次初始姿态，让开机第一帧就按实际摆放方向画；IMU 不可用时保持 R0，
+  // 不影响其余功能。
+  hwRotationInit();
   if (!hwRtcInit())        die("rtc");
 
   Serial.println(s_initOk ? "hwInit OK" : "hwInit DONE (some failures)");
