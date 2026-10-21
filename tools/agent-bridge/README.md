@@ -42,9 +42,9 @@ python tools/agent-bridge/bridge.py
 启动时打印设备要用的地址，直接填进 `data/config.json` 的 `agent_url`：
 
 ```
-  device poll   http://172.16.0.12:8787/agent
+  device poll   http://192.168.1.10:8787/agent
   instant push  udp   -> device:8788 (after first poll)
-  firmware config:  "agent_url": "http://172.16.0.12:8787/agent"
+  firmware config:  "agent_url": "http://192.168.1.10:8787/agent"
 ```
 
 ### 让桥接常驻（重要）
