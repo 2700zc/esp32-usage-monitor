@@ -31,6 +31,7 @@ PlatformIO + Arduino 框架，配置放在板子的文件系统里，凭据不�
 - [功能一览](#功能一览)
 - [硬件需求](#硬件需求)
 - [快速开始](#快速开始)：装环境 → 取代码 → 填配置 → 烧写 → 首次开机
+- [刷入固件](FLASHING.md)：预编译包（不用编译）、AI/命令行刷写、故障排查
 - [配置详解](#配置详解)：每个凭据从哪里拿
 - [ZCode 状态页完整教程](#zcode-状态页完整教程)：PC 端装 hook 与桥接
 - [日常使用](#日常使用)：按键、滑动、刷新
@@ -71,6 +72,15 @@ PlatformIO + Arduino 框架，配置放在板子的文件系统里，凭据不�
 | 电脑 | Windows（脚本按 Windows 写的；固件本身跨平台） |
 
 ## 快速开始
+
+### 0. 最省事：直接刷预编译固件（不用编译）
+
+到 [Releases](https://github.com/2700zc/esp32-usage-monitor/releases/latest) 下载
+`esp32-usage-monitor-flash.zip`（约 1.1MB），解压后双击 `flash.bat`。只需要
+**Python 3**；脚本会自动安装 esptool（约 7MB），不需要 PlatformIO，也不需要
+编译工具链。详细说明和故障排查见 [FLASHING.md](FLASHING.md)。
+
+下面的 1–5 步是给要改代码的人看的。
 
 ### 1. 装开发环境
 
