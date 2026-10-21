@@ -62,8 +62,10 @@
 #define BOARD_HAS_AUTO_ROTATE      1
 // MADCTL override: Arduino_CO5300's setRotation only does X/Y mirror, not
 // row/column swap (MV bit). Setting this to non-zero writes 0x36 directly
-// after canvas->begin(). 0x60 = MV+MX (90° CW); 0xA0 = MV+MY (90° CCW); 0 = no override.
-#define BOARD_CO5300_MADCTL        0xA0   // MV+MY (90° CCW; opposite rotation of 0x60 / MV+MX)
+// after canvas->begin(). 0xA0 (MV+MY) is the portrait baseline; 0 = no override.
+// 实测备注：这块 2.16 面板上相对 0xA0，0x00 是逆时针 90°、0xC0 是顺时针 90°，
+// 早先注释把这两个方向标反了。四向表见 display.cpp 的 ROT_MADCTL。
+#define BOARD_CO5300_MADCTL        0xA0
 #define BOARD_DISPLAY_LETTERBOX    1   // CO5300 needs one-shot blit; S3 has PSRAM for full frame buf
 #define BOARD_DISPLAY_DEST_W       368   // 184 × 2 (exact integer upscale; bilinear == nearest at 2×)
 #define BOARD_DISPLAY_DEST_H       448   // 224 × 2

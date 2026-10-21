@@ -14,13 +14,12 @@ static ScreenRot         s_rot    = ScreenRot::R0;
 static const uint8_t BRIGHT_LUT[5] = { 50, 100, 150, 200, 255 };
 
 #if BOARD_HAS_AUTO_ROTATE
-// 内容旋转角 → MADCTL。基线 0xA0 (MV+MY) 是当前竖屏，板级注释里明确：
-// 0x60 = MV+MX 是 90° CW，0xA0 = MV+MY 是 90° CCW。因此在 0xA0 基础上：
-//   0x00 = 顺时针 90°（= 从 native 0x00 起算的 0°，相对 0xA0 是 90° CW）
-//   0x60 = 180°
-//   0xC0 = 逆时针 90°
-// 若实测两个侧向方向上下颠倒，交换 R90/R270 这两项即可。
-static const uint8_t ROT_MADCTL[4] = { 0xA0, 0x00, 0x60, 0xC0 };
+// 内容旋转角 → MADCTL。基线 0xA0 (MV+MY) 是当前竖屏。
+// 实测修正：板级注释把 0x00/0xC0 的 90° 方向标反了——在这块 2.16 面板上
+//   0x00 = 逆时针 90°（相对 0xA0），0xC0 = 顺时针 90°，0x60 = 180°。
+// 因此 R90（内容顺时针）用 0xC0，R270（内容逆时针）用 0x00。
+// 竖屏 R0 与倒置 R180 不受影响。
+static const uint8_t ROT_MADCTL[4] = { 0xA0, 0xC0, 0x60, 0x00 };
 static_assert(BOARD_CO5300_MADCTL == 0xA0, "ROT_MADCTL table assumes 0xA0 baseline");
 #endif
 
