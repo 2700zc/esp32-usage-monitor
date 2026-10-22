@@ -1,6 +1,7 @@
 #define spr (*hwCanvas())
 
 #include "config.h"
+#include "page_settings.h"
 #include "agent_client.h"
 #include "deepseek_client.h"
 #include "opencode_client.h"
@@ -27,6 +28,8 @@ static const uint16_t MAIN_YELLOW = 0xFFE0;
 static const uint32_t REFRESH_ROUND_MS   = 60000;
 static const uint32_t USAGE_FETCH_GAP_MS = 500;
 static const uint32_t CONNECT_TIMEOUT_MS = 10000;  // 自动连接 10 秒超时
+// BOOT 按住这么久进页面设置；短按仍走原来的 WiFi 配置（见 loop 里的按键结算）
+static const uint32_t PAGE_SETTINGS_HOLD_MS = 700;
 
 // Agent 状态页的节奏与上面那轮无关：用量一分钟一变，状态一秒一变。局域网里的
 // 小请求只要几十毫秒；桥接不在时它最多阻塞 1.2 秒，但阻塞的是后台任务。
@@ -71,11 +74,24 @@ static volatile uint32_t s_netGen      = 0;   // 每次连上 WiFi +1，任务�
 
 // 页面顺序：Agent 状态在最前，其余三家与 TokenHub 一致（OpenCode Go →
 // CommandCode → DeepSeek）。没配齐凭据的服务商不生成页面（只配了 DeepSeek
-// 就仍是单页，滑动无效果）。
+// 就仍是单页，滑动无效果）；页面开关关掉的服务商同样不生成——s_pages 同时
+// 驱动绘制和 60 秒抓取轮次，所以"不显示"天然等于"不再请求"。
 enum class Prov : uint8_t { Agent, Oc, Cc, Ds };
 static Prov s_pages[4];
 static int  s_pageCount = 0;
 static int  s_page      = 0;
+
+// 页面开关（NVS 持久化）。隐藏的服务商从 s_pages 里消失，用量任务就不会再
+// 抓它；Agent 任务另有开关判断，见 agentNetTask。
+static uint8_t  s_pageMask      = PG_ALL;
+static bool     s_inPageSettings = false;
+static PageSettings s_pgSettings;
+static int8_t   s_pgDrawnSel  = -1;   // 设置页按需重绘：选择/开关变了或超时才画
+static uint8_t  s_pgDrawnMask = 0xFF;
+static uint32_t s_pgDrawMs    = 0;
+// BOOT 长按/短按结算：本次按住是否已按长按处理、本次抬起是否要吞掉短按动作
+static bool     s_bootLongDone = false;
+static bool     s_bootSwallow  = false;
 
 // ── Agent 发现/轮询状态（只在 agentNetTask 里读写）──
 static WiFiUDP  s_agentUdp;
@@ -124,10 +140,10 @@ static void buildPages(const AppConfig& c) {
   s_pageCount = 0;
   // 状态页放第一页：它是唯一"此刻正在发生"的一页，开机默认停在它上面才有意义
   // （另外三页都是用量汇总，早一分钟晚一分钟看到没区别）。
-  if (cfgAgentReady(c)) s_pages[s_pageCount++] = Prov::Agent;
-  if (cfgOcReady(c)) s_pages[s_pageCount++] = Prov::Oc;
-  if (cfgCcReady(c)) s_pages[s_pageCount++] = Prov::Cc;
-  if (cfgDsReady(c)) s_pages[s_pageCount++] = Prov::Ds;
+  if (s_pageMask & PG_AGENT)                s_pages[s_pageCount++] = Prov::Agent;
+  if ((s_pageMask & PG_OC) && cfgOcReady(c)) s_pages[s_pageCount++] = Prov::Oc;
+  if ((s_pageMask & PG_CC) && cfgCcReady(c)) s_pages[s_pageCount++] = Prov::Cc;
+  if ((s_pageMask & PG_DS) && cfgDsReady(c)) s_pages[s_pageCount++] = Prov::Ds;
   if (s_page >= s_pageCount) s_page = 0;
 }
 
@@ -316,11 +332,35 @@ static void startNtp() {
 // 都只发生在 core 0 的这个任务里。
 static void agentNetTask(void*) {
   uint32_t lastGen = 0;
+  bool     pageOn  = true;
 
   for (;;) {
     if (!s_wifiConnected || s_inWifiConfig) {
       vTaskDelay(pdMS_TO_TICKS(100));
       continue;
+    }
+    // 状态页被关掉时不进局域网找桥接、也不轮询（UDP 推送没人看）。重新打开
+    // 时把节奏归零，立刻取一次而不是等下一次退避。
+    if (!(s_pageMask & PG_AGENT)) {
+      pageOn = false;
+      vTaskDelay(pdMS_TO_TICKS(200));
+      continue;
+    }
+    if (!pageOn) {
+      pageOn            = true;
+      s_lastAgentPoll   = 0;
+      s_lastProbe       = 0;
+      s_agentFailStreak = 0;
+      s_agentSearchStart = 0;
+      // 关闭期间桥接的推送还排在 socket 缓冲里；丢掉它们，否则刚打开的一瞬间
+      // 会先把旧状态画上去（紧接着的轮询才是权威值）。
+      if (s_agentUdpReady) {
+        for (int i = 0; i < 8 && s_agentUdp.parsePacket() > 0; i++) {
+          uint8_t junk[64];
+          s_agentUdp.read(junk, sizeof(junk));
+        }
+      }
+      Serial.println("agent: page re-enabled, resuming");
     }
     if (lastGen != s_netGen) {
       lastGen = s_netGen;
@@ -449,7 +489,7 @@ static void usageNetTask(void*) {
 // 优先级高于数据自带的 lastError。
 static void drawCurrentPage(const char* ip, const char* netStatus) {
   if (s_pageCount == 0) {
-    usageDisplayDrawEmpty(ip);
+    usageDisplayDrawEmpty(ip, (s_pageMask & PG_ALL) == 0);
     return;
   }
   switch (s_pages[s_page]) {
@@ -483,11 +523,12 @@ void setup() {
   hwDisplayPush();
 
   s_dataMux = xSemaphoreCreateMutex();
+  s_pageMask = pageMaskLoad();
   loadConfig(s_cfg);
   buildPages(s_cfg);
   agentSeedFromConfig();
-  Serial.printf("boot: %d page(s) ready (agent=%d oc=%d cc=%d ds=%d)\n",
-                s_pageCount, (int)cfgAgentReady(s_cfg), (int)cfgOcReady(s_cfg),
+  Serial.printf("boot: %d page(s), mask=0x%02X (agent=%d oc=%d cc=%d ds=%d)\n",
+                s_pageCount, s_pageMask, (int)cfgAgentReady(s_cfg), (int)cfgOcReady(s_cfg),
                 (int)cfgCcReady(s_cfg), (int)cfgDsReady(s_cfg));
 
   // 网络请求全部放在 core 0 的后台任务里；loop() 只负责触摸和绘制。
@@ -517,6 +558,7 @@ void loop() {
   if (hwRotationPoll()) {
     s_drawnPage  = -1;
     s_lastDrawMs = 0;
+    s_pgDrawMs   = 0;     // 设置页下一帧重画（旋转后整个内容方向变了）
   }
 
   if (!s_wifiConnected) {
@@ -526,7 +568,7 @@ void loop() {
       startNtp();
       s_netGen++;
       s_cmdRefresh = true;       // 连上就立刻刷一轮用量
-    } else if (s_wifiConnStart != 0 && !s_inWifiConfig &&
+    } else if (s_wifiConnStart != 0 && !s_inWifiConfig && !s_inPageSettings &&
                millis() - s_wifiConnStart >= CONNECT_TIMEOUT_MS) {
       // 自动连接超时：回到 WiFi 配置界面重新选择
       Serial.println("wifi: auto-connect timeout, entering setup");
@@ -558,15 +600,15 @@ void loop() {
 
   // ── 左右滑动切页（到头循环）──
   SwipeDir dir = hwSwipePoll();
-  if (!s_inWifiConfig && s_pageCount > 1 && dir != SwipeDir::None) {
+  if (!s_inWifiConfig && !s_inPageSettings && s_pageCount > 1 && dir != SwipeDir::None) {
     if (dir == SwipeDir::Left) s_page = (s_page + 1) % s_pageCount;
     else                       s_page = (s_page + s_pageCount - 1) % s_pageCount;
     Serial.printf("swipe: -> page %d/%d\n", s_page + 1, s_pageCount);
   }
 
   // PWR 键：已连接时立刻刷一轮（顺带把状态页也立刻重试，不用等退避）；
-  // 自动连接等待中则直接进入 WiFi 配置
-  if (hwBtnA().wasPressed && !s_inWifiConfig) {
+  // 自动连接等待中则直接进入 WiFi 配置。设置页里它用来选行，不触发刷新。
+  if (hwBtnA().wasPressed && !s_inWifiConfig && !s_inPageSettings) {
     if (s_wifiConnected) {
       s_cmdRefresh  = true;
       s_cmdAgentNow = true;
@@ -578,10 +620,72 @@ void loop() {
     }
   }
 
-  // BOOT 键进 WiFi 配置
-  if (hwBtnBoot().wasPressed && !s_inWifiConfig) {
-    s_inWifiConfig = true;
-    wfInit(s_wfCfg);
+  // BOOT 键：短按进 WiFi 配置，长按进页面开关。长按得按住等到阈值，所以短按
+  // 改在抬起时结算；已经按长按处理过的这次按住，抬手不再触发短按动作。
+  {
+    const HwBtn& boot = hwBtnBoot();
+    if (boot.wasPressed) {
+      s_bootLongDone = false;
+      s_bootSwallow  = false;
+    }
+    if (!s_inWifiConfig && !s_inPageSettings && boot.isPressed &&
+        !s_bootLongDone && boot.pressedFor(PAGE_SETTINGS_HOLD_MS)) {
+      s_bootLongDone   = true;
+      s_bootSwallow    = true;
+      s_inPageSettings = true;
+      pageSettingsInit(s_pgSettings, s_pageMask);
+      s_pgDrawnSel = -1;
+      s_pgDrawMs   = 0;
+      Serial.println("pages: settings opened");
+    }
+    if (!s_inWifiConfig && !s_inPageSettings && boot.wasReleased) {
+      if (!s_bootLongDone && !s_bootSwallow) {
+        s_inWifiConfig = true;
+        wfInit(s_wfCfg);
+      }
+      s_bootSwallow = false;
+    }
+  }
+
+  // ── 页面开关 ──
+  if (s_inPageSettings) {
+    if (pageSettingsTick(s_pgSettings)) {
+      // 这次 BOOT 已经用来按「完成」了：抬手别再开 WiFi 配置，按住不放也
+      // 别在退出后的下一帧又被长按判定抓回设置页。
+      s_bootSwallow    = true;
+      s_bootLongDone   = true;
+      s_inPageSettings = false;
+      (void)hwSwipePoll();          // 设置页期间没跑手势层，清掉可能残留的滑动
+      if (s_pgSettings.mask != s_pageMask) {
+        const uint8_t before = s_pageMask;
+        s_pageMask = s_pgSettings.mask;
+        pageMaskSave(s_pageMask);
+        buildPages(s_cfg);
+        s_page = 0;
+        // 只有"新打开"的页面需要立刻取数；单纯关掉不必多跑一轮
+        if (s_pageMask & (uint8_t)~before) {
+          s_cmdRefresh  = true;
+          s_cmdAgentNow = true;
+          s_cmdProbeNow = true;
+        }
+        Serial.printf("pages: saved mask=0x%02X, %d page(s)\n", s_pageMask, s_pageCount);
+      }
+      s_drawnPage  = -1;
+      s_lastDrawMs = 0;
+    } else {
+      const bool due = (s_pgDrawnSel != s_pgSettings.sel) ||
+                       (s_pgDrawnMask != s_pgSettings.mask) ||
+                       (s_pgDrawMs == 0) || (millis() - s_pgDrawMs >= 500);
+      if (due) {
+        pageSettingsDraw(s_pgSettings, s_cfg);
+        hwDisplayPush();
+        s_pgDrawnSel  = s_pgSettings.sel;
+        s_pgDrawnMask = s_pgSettings.mask;
+        s_pgDrawMs    = millis();
+      }
+    }
+    delay(10);
+    return;
   }
 
   bool dataChanged = syncSharedData();

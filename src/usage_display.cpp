@@ -586,20 +586,20 @@ void usageDisplayDrawAgent(const AgentStatus& data, const char* ip, int page, in
   drawStatusBar(ip);
 }
 
-void usageDisplayDrawEmpty(const char* ip) {
+void usageDisplayDrawEmpty(const char* ip, bool pagesOff) {
   spr.fillScreen(COL_BG);
-  drawHeader("用量监控", COL_TEXT2, "未配置服务商", COL_TEXT2);
+  drawHeader("用量监控", COL_TEXT2, pagesOff ? "所有页面已关闭" : "未配置服务商", COL_TEXT2);
   drawGradCard(76, 104, 0x220D, 0x0883);
   spr.setFont(u8g2_font_wqy16_t_gb2312b);
   spr.setTextColor(COL_TEXT);
   spr.setCursor(UI_M + 16, 106);
-  spr.print("还没有凭据");
+  spr.print(pagesOff ? "页面都关了" : "还没有凭据");
   spr.setFont(u8g2_font_wqy12_t_gb2312b);
   spr.setTextColor(COL_TEXT2);
   spr.setCursor(UI_M + 16, 134);
-  spr.print("编辑 data/config.json");
+  spr.print(pagesOff ? "长按 BOOT" : "编辑 data/config.json");
   spr.setCursor(UI_M + 16, 156);
-  spr.print("再执行 uploadfs");
+  spr.print(pagesOff ? "打开页面开关" : "再执行 uploadfs");
   drawPageDots(0, 1);
   drawStatusBar(ip);
 }

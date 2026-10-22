@@ -27,8 +27,9 @@ inline bool cfgOcReady(const AppConfig& c) {
 }
 inline bool cfgCcReady(const AppConfig& c) { return c.cc_cookie[0] != 0; }
 inline bool cfgDsReady(const AppConfig& c) { return c.ds_token[0] != 0; }
-// 状态页总是存在：板子会在局域网里自己广播找桥接，所以不填 agent_url 也能用；
-// 填了则先用它，取不到再退回发现（换电脑/换 IP 时不用重刷文件系统）。
+// 状态页只依赖开关（不依赖凭据）：板子会在局域网里自己广播找桥接，所以不填
+// agent_url 也能用；填了则先用它，取不到再退回发现（换电脑/换 IP 时不用重刷
+// 文件系统）。是否显示由 page_settings 的 PG_AGENT 位决定，见 buildPages()。
 inline bool cfgAgentReady(const AppConfig&) { return true; }
 
 // 复制并去掉首尾空白。手写 JSON 时很容易在值前后留下空格或换行，而" "是非空

@@ -20,5 +20,6 @@ void usageDisplayDrawOc(const OpenCodeUsage& data, const char* ip, int page, int
 void usageDisplayDrawCc(const CommandCodeUsage& data, const char* ip, int page, int pageCount,
                         const char* netStatus = nullptr);
 
-// 一个服务商都没配置时的空状态
-void usageDisplayDrawEmpty(const char* ip);
+// 一个页面都没有时的空状态。pagesOff = 页面开关全关（与"没配凭据"区分开，
+// 前者要提示怎么把开关打开）。
+void usageDisplayDrawEmpty(const char* ip, bool pagesOff);
