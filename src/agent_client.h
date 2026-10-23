@@ -74,9 +74,10 @@ enum AgActCode : uint8_t {
   agActFailed,      // 其它非 200
 };
 
-// 同步发送一个预定义动作（name = "enter" / "esc"）。httpStatus 输出实际状态码
-// （0 = 网络层失败）。enter 在桥接侧要先做 UIA 聚焦（约 0.5-1.5 秒），所以超时
-// 比状态轮询长；esc 不需要聚焦，但共用同一路径。
+// 同步发送一个预定义动作（name = "enter" / "esc" / "ralt"）。httpStatus 输出
+// 实际状态码（0 = 网络层失败）。enter / ralt 在桥接侧要先做 UIA 聚焦（预热后
+// 约 0.5-1.5 秒，冷启动 2.6-2.9 秒），所以超时比状态轮询长得多；esc 不需要
+// 聚焦，但共用同一路径。
 AgActCode agSendAct(const char* name, const char* host, uint16_t port,
                     const char* token, int& httpStatus);
 

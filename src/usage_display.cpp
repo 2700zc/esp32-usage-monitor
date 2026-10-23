@@ -1,5 +1,6 @@
 #include "usage_display.h"
 #include "hw/display.h"
+#include "hw/ble_hid.h"
 #include <Arduino.h>
 #include <cstdio>
 #include <math.h>
@@ -25,6 +26,7 @@ static const uint16_t COL_AGENT   = 0x8AFE;  // #8B5CF6 Agent 状态页
 static const uint16_t COL_GREEN   = 0x2E6E;  // #2ECC71 思考完成
 static const uint16_t COL_SEND    = 0xFFE0;  // #FFE000 按键页的 Enter
 static const uint16_t COL_ESC     = 0xFD20;  // #FFA020 按键页的 Esc
+static const uint16_t COL_RALT    = 0x4C7F;  // #4C8DFF 按键页的右 Alt
 
 // 画布 184×224（2× 放大到物理 480×480）；边距 4 = 物理 8px，卡片几乎铺满
 static const int UI_M  = 4;
@@ -599,7 +601,7 @@ void usageDisplayDrawEmpty(const char* ip, bool pagesOff) {
   spr.setFont(u8g2_font_wqy12_t_gb2312b);
   spr.setTextColor(COL_TEXT2);
   spr.setCursor(UI_M + 16, 134);
-  spr.print(pagesOff ? "长按 BOOT" : "编辑 data/config.json");
+  spr.print(pagesOff ? "双击 PWR" : "编辑 data/config.json");
   spr.setCursor(UI_M + 16, 156);
   spr.print(pagesOff ? "打开页面开关" : "再执行 uploadfs");
   drawPageDots(0, 1);
@@ -621,35 +623,51 @@ void usageDisplayDrawSend(const AgentStatus& bridge, const SendUiState& ui,
                           const char* ip, int page, int pageCount, const char* netStatus) {
   spr.fillScreen(COL_BG);
 
-  const char* sub;
-  uint16_t    subColor;
+  // 页头同时显示蓝牙和桥接：右 Alt 走蓝牙，回车/Esc 走桥接。
+  const char* bri;
+  uint16_t    briColor;
   if (netStatus) {
-    sub = netStatus;                        subColor = COL_RED;
+    bri = netStatus;                        briColor = COL_RED;
   } else if (bridge.valid && bridge.lastError == agErrOk) {
-    sub = "桥接 · 已连接";                  subColor = COL_GREEN;
+    bri = "桥接已连";                       briColor = COL_GREEN;
   } else if (bridge.lastError == agErrSearching) {
-    sub = "桥接 · 正在查找";                subColor = COL_TEXT2;
+    bri = "找桥接";                         briColor = COL_TEXT2;
   } else if (bridge.lastError == agErrNotFound) {
-    sub = "桥接 · 没找到";                  subColor = COL_AMBER;
+    bri = "桥接未找到";                     briColor = COL_AMBER;
   } else {
-    sub = "桥接 · 未连接";                  subColor = COL_RED;
+    bri = "桥接未连";                       briColor = COL_RED;
   }
-  drawHeader("按键", COL_SEND, sub, subColor);
+  const bool bleOn = bleHidReady();
+  char subBuf[44];
+  snprintf(subBuf, sizeof(subBuf), "%s · %s", bleOn ? "蓝牙已连" : "蓝牙未连", bri);
+  const uint16_t subColor = bleOn && briColor == COL_GREEN ? COL_GREEN
+                          : bleOn ? COL_AMBER : briColor;
+  drawHeader("按键", COL_SEND, subBuf, subColor);
 
-  // 两张说明卡：按键是物理键 IO18，触摸只负责显示。
-  drawCardBase(42);
-  drawCardValue(42, "回车", COL_SEND);
-  drawCardRow1(42, "短按 IO18", "Enter");
-
-  drawCardBase(100);
-  drawCardValue(100, "Esc", COL_ESC);
-  drawCardRow1(100, "长按 IO18 0.7 秒", "Escape");
+  // 三行按键说明：按键是物理键，触摸只负责显示。
+  static const char* const ROW_KEY[3] = { "IO18 短按", "IO18 长按", "BOOT 短按" };
+  const char* ROW_ACT[3] = { "回车", "Esc", bleOn ? "右 Alt · 蓝牙" : "右 Alt · 桥接" };
+  static const uint16_t    ROW_COL[3] = { COL_SEND, COL_ESC, COL_RALT };
+  for (int i = 0; i < 3; i++) {
+    const int y = 44 + i * 32;
+    spr.fillRoundRect(UI_M, y, UI_CW, 28, 6, COL_CARD);
+    spr.setFont(u8g2_font_wqy12_t_gb2312b);
+    spr.setTextColor(COL_TEXT2);
+    spr.setCursor(UI_M + 10, y + 18);
+    spr.print(ROW_KEY[i]);
+    int w = textWidth(ROW_ACT[i], 12, 1);
+    spr.setTextColor(ROW_COL[i]);
+    spr.setCursor(UI_M + UI_CW - 10 - w, y + 18);
+    spr.print(ROW_ACT[i]);
+  }
 
   // 最近一次结果。--result = -1 表示这次开机还没按过。
   char line[44];
   uint16_t color = COL_TEXT2;
   if (ui.busy) {
-    strlcpy(line, ui.busyAction ? "正在按 Esc…" : "正在发送回车…", sizeof(line));
+    static const char* const BUSY[3] = { "正在发送回车…", "正在按 Esc…", "正在按右 Alt…" };
+    strlcpy(line, BUSY[ui.busyAction >= 0 && ui.busyAction < 3 ? ui.busyAction : 0],
+            sizeof(line));
     color = COL_AMBER;
   } else if (ui.result < 0) {
     strlcpy(line, "还没按过键", sizeof(line));
@@ -657,7 +675,8 @@ void usageDisplayDrawSend(const AgentStatus& bridge, const SendUiState& ui,
     const char* text;
     switch ((AgActCode)ui.result) {
       case agActOk:
-        text = ui.lastAction ? "已按 Esc" : "已发送回车";
+        text = ui.lastAction == 2 ? "已按右 Alt"
+             : ui.lastAction == 1 ? "已按 Esc" : "已发送回车";
         color = COL_GREEN; break;
       case agActNoToken:    text = "未配置 act_token";   color = COL_AMBER; break;
       case agActNoHost:     text = "还没找到桥接";       color = COL_AMBER; break;
@@ -674,8 +693,10 @@ void usageDisplayDrawSend(const AgentStatus& bridge, const SendUiState& ui,
     else          snprintf(line, sizeof(line), "%s · %lu分前", text,
                            (unsigned long)(sec / 60));
   }
-  drawCentered(line, 172, 1, color);
-  drawCentered("物理键在任意页面生效", 190, 1, COL_TEXT2);
+  drawCentered(line, 154, 1, color);
+  drawCentered("物理键在任意页面生效", 172, 1, COL_TEXT2);
+  drawCentered(bleOn ? "双击 PWR 进设置页" : "蓝牙配对名 ESP32-Monitor",
+               189, 1, bleOn ? COL_TEXT2 : COL_AMBER);
 
   drawPageDots(page, pageCount);
   drawStatusBar(ip);

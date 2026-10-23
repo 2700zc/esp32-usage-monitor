@@ -157,16 +157,23 @@ python bridge.py --announce-to 192.168.1.50     # 板子当前的 IP，喊一次
 
 ### 动作接口 `/act`（按键页，实验性）
 
-固件里有一页「按键」（默认隐藏），用物理键 IO18 触发：**短按 = 回车，长按 0.7 秒
-= Esc**。它是目前唯一会让 PC **产生动作**的接口，所以和只读的 `/agent` 分开设计：
+固件里有一页「按键」（默认隐藏），用物理键触发：**IO18 短按 = 回车，IO18 长按
+0.7 秒 = Esc，BOOT 短按 = 右 Alt**。它是目前唯一会让 PC **产生动作**的接口，
+所以和只读的 `/agent` 分开设计：
 
-- **token 必填**，只接受预定义动作 `name=enter` / `name=esc`；
+> **右 Alt 的例外**：固件优先用 **BLE HID**（把自己枚举成真实蓝牙键盘）发右 Alt，
+> 只有未配对/未连接时才回退到这里的 `/act?name=ralt`。豆包输入法等程序会过滤
+> SendInput 注入的键（低级钩子里的 `LLKHF_INJECTED`），桥接的右 Alt 对它们无效；
+> 回车/Esc 不受影响，仍然走桥接。
+
+- **token 必填**，只接受预定义动作 `name=enter` / `name=esc` / `name=ralt`；
 - **默认只允许前台窗口属于 `zcode.exe`**——按键触发的那一刻焦点不可控，
   回车打进终端会直接执行已经敲好但没回车的命令；
 - **回车注入前先用 UIA 把输入框聚焦**，并确认 `HasKeyboardFocus` 为真才发键。
   ZCode 的 Enter 提交处理挂在编辑器上，光标不在输入框时按键等于按在空白处；
   更糟的是确认弹窗是全局 Enter，盲发可能替用户点掉授权框。聚焦失败就不发键（422）。
-- **Esc 不需要聚焦**：它是窗口级按键，直接注入（关弹窗、取消生成都靠它）；
+- **Esc / 右 Alt 不需要聚焦**：它们是窗口级按键，直接注入。右 Alt 用
+  `VK_RMENU` + `KEYEVENTF_EXTENDEDKEY`（扫描码 0x38），否则应用会把它当成左 Alt；
 - 桥接关掉 `/act` 时接口返回 403，设备屏幕上会写「令牌不对/未启用」。
 
 配置分两步：
@@ -183,11 +190,13 @@ pio run -t uploadfs
 启动横幅会打印 `act enabled for zcode.exe`；没打印说明没找到令牌，`/act` 会拒绝
 所有请求。
 
-设备上的页面要手动打开：**长按 BOOT（0.7 秒）→「按键页」→ BOOT 切换 →「完成」**。
-打开后 IO18 在任意页面都生效（设置页 / WiFi 配置页里它要选行，不触发动作）。
-它是实验性功能，默认关闭，不影响其他页和用量抓取。
+设备上的页面要手动打开：**双击 PWR →「按键页」→ BOOT 切换 →「完成」**。
+打开后 IO18 / BOOT 的按键动作在任意页面都生效（设置页 / WiFi 配置页里它们要
+选行，不触发动作）。按键页关闭时 BOOT 短按仍是 WiFi 配置快捷入口；打开后
+WiFi 配置从设置页的「WiFi 配置」行进入。它是实验性功能，默认关闭，不影响其他页
+和用量抓取。
 
-`GET /act?name=enter&tok=<token>` 和 `...&name=esc&tok=<token>` 的返回：
+`GET /act?name=enter|esc|ralt&tok=<token>` 的返回：
 
 | 状态码 | 含义 |
 |---|---|
@@ -201,7 +210,7 @@ pio run -t uploadfs
 **前提（只影响回车）：ZCode 的无障碍树要可见。** 平时跑过 Computer Use 之后它会被
 打开并保持；冷启动的 ZCode 可能一个 Edit 都查不到，这时按键页会显示「找不到输入框」。
 解决办法是给 ZCode 的启动快捷方式加 Chromium 标准开关
-`--force-renderer-accessibility`（不要开调试端口）。Esc 不依赖它。
+`--force-renderer-accessibility`（不要开调试端口）。Esc 和右 Alt 不依赖它。
 
 前台程序默认只认 `zcode.exe`。要临时允许别的程序（例如先在记事本里试），用
 `--act-app notepad.exe`；可以重复给多次。**不建议长期放开终端类窗口。**

@@ -22,30 +22,35 @@ static const uint16_t C_WARN  = 0xFD20;
 static const int UI_M  = 4;
 static const int UI_CW = 176;
 
-// 五行页面 + 一行「完成」。原先四行用的是行高 28/间距 30，加一行后压到
-// 24/26，最后一行的底边 170，「完成」放在 176——224 高的画布正好放下。
-static const int ROW_Y0    = 42;
-static const int ROW_H     = 24;
-static const int ROW_PITCH = 26;
-static const int ROW_COUNT = 5;
-static const int DONE_SEL  = 5;
+// 五个页面开关 + 一行「WiFi 配置」+ 一行「完成」。6 行把行高/间距压到
+// 21/22：最后一行底边 171，「完成」176..202，提示行 214，224 高的画布放得下。
+static const int ROW_Y0    = 40;
+static const int ROW_H     = 21;
+static const int ROW_PITCH = 22;
+static const int ROW_COUNT = 6;
+static const int TOGGLE_COUNT = 5;   // 前 5 行是页面开关，最后一行是 WiFi 入口
+static const int DONE_SEL  = 6;
 static const int DONE_Y    = 176;
 static const int DONE_H    = 26;
 
 static const char* PAGES_NVS_NS = "pages";
 
+enum RowKind : uint8_t { ROW_TOGGLE, ROW_WIFI };
+
 struct RowDef {
   const char* label;
   uint16_t    accent;
-  uint8_t     bit;
+  uint8_t     bit;    // ROW_WIFI 行为 0，不参与 mask
+  RowKind     kind;
 };
 
 static const RowDef ROWS[ROW_COUNT] = {
-  { "状态页",       0x8AFE, PG_AGENT },  // Agent 紫
-  { "OpenCode Go",  0x1BBA, PG_OC    },  // #1976d2
-  { "CommandCode",  0x044F, PG_CC    },  // #00897b
-  { "DeepSeek",     0x4C7F, PG_DS    },  // #4C8DFF
-  { "按键页",       0xFFE0, PG_SEND  },  // 实验性：IO18 短按回车 / 长按 Esc
+  { "状态页",       0x8AFE, PG_AGENT, ROW_TOGGLE },  // Agent 紫
+  { "OpenCode Go",  0x1BBA, PG_OC,    ROW_TOGGLE },  // #1976d2
+  { "CommandCode",  0x044F, PG_CC,    ROW_TOGGLE },  // #00897b
+  { "DeepSeek",     0x4C7F, PG_DS,    ROW_TOGGLE },  // #4C8DFF
+  { "按键页",       0xFFE0, PG_SEND,  ROW_TOGGLE },  // 实验性：IO18 短按回车 / 长按 Esc
+  { "WiFi 配置",    0x4C7F, 0,        ROW_WIFI   },  // 进入 WiFi 配置界面
 };
 
 static bool rowConfigured(int i, const AppConfig& c) {
@@ -54,7 +59,7 @@ static bool rowConfigured(int i, const AppConfig& c) {
     case 1:  return cfgOcReady(c);
     case 2:  return cfgCcReady(c);
     case 3:  return cfgDsReady(c);
-    default: return true;          // 按键页只依赖桥接与 act_token，不算"未配置"
+    default: return true;          // 按键页 / WiFi 配置不依赖服务商凭据
   }
 }
 
@@ -95,20 +100,21 @@ void pageSettingsDraw(const PageSettings& s, const AppConfig& cfg) {
 
   int onCount = 0;
   for (int i = 0; i < ROW_COUNT; i++)
-    if (s.mask & ROWS[i].bit) onCount++;
+    if (ROWS[i].kind == ROW_TOGGLE && (s.mask & ROWS[i].bit)) onCount++;
 
   spr.setFont(u8g2_font_wqy12_t_gb2312b);
   spr.setTextColor(C_TEXT2);
   spr.setCursor(UI_M, 36);
-  spr.print("关闭后不显示也不获取");
+  spr.print("页面开关 · WiFi 配置");
   char cnt[16];
-  snprintf(cnt, sizeof(cnt), "%d/%d 页", onCount, ROW_COUNT);
+  snprintf(cnt, sizeof(cnt), "%d/%d 页", onCount, TOGGLE_COUNT);
   spr.setCursor(UI_M + UI_CW - 36, 36);
   spr.print(cnt);
 
   for (int i = 0; i < ROW_COUNT; i++) {
     const int y   = ROW_Y0 + i * ROW_PITCH;
-    const bool on = (s.mask & ROWS[i].bit) != 0;
+    const bool toggle = (ROWS[i].kind == ROW_TOGGLE);
+    const bool on  = toggle && (s.mask & ROWS[i].bit) != 0;
     const bool sel = (s.sel == i);
 
     spr.fillRoundRect(UI_M, y, UI_CW, ROW_H, 6, sel ? C_SEL : C_CARD);
@@ -116,21 +122,28 @@ void pageSettingsDraw(const PageSettings& s, const AppConfig& cfg) {
 
     spr.fillCircle(UI_M + 10, y + ROW_H / 2, 3, ROWS[i].accent);
     spr.setFont(u8g2_font_wqy12_t_gb2312b);
-    spr.setTextColor(on ? C_TEXT : C_TEXT2);
-    spr.setCursor(UI_M + 18, y + 16);
+    spr.setTextColor(!toggle || on ? C_TEXT : C_TEXT2);
+    spr.setCursor(UI_M + 18, y + 15);
     spr.print(ROWS[i].label);
 
     // 没凭据的页即使打开也不会出现，先把原因写在行里，省得以为是开关坏了
     if (!rowConfigured(i, cfg)) {
       spr.setTextColor(C_WARN);
-      spr.setCursor(UI_M + UI_CW - 68, y + 16);
+      spr.setCursor(UI_M + UI_CW - 68, y + 15);
       spr.print("未配置");
     } else if (ROWS[i].bit == PG_SEND) {
       spr.setTextColor(C_WARN);
-      spr.setCursor(UI_M + UI_CW - 56, y + 16);
+      spr.setCursor(UI_M + UI_CW - 56, y + 15);
       spr.print("实验");
     }
-    drawSwitch(UI_M + UI_CW - 30, y + 6, on, ROWS[i].accent);
+    if (toggle) {
+      drawSwitch(UI_M + UI_CW - 30, y + 5, on, ROWS[i].accent);
+    } else {
+      // WiFi 行不是开关：右侧写「进入」，BOOT 打开配置界面
+      spr.setTextColor(C_TEXT2);
+      spr.setCursor(UI_M + UI_CW - 30, y + 15);
+      spr.print("进入");
+    }
   }
 
   const bool dsel = (s.sel == DONE_SEL);
@@ -146,10 +159,10 @@ void pageSettingsDraw(const PageSettings& s, const AppConfig& cfg) {
   spr.setFont(u8g2_font_wqy12_t_gb2312b);
   spr.setTextColor(C_TEXT2);
   spr.setCursor(UI_M, 214);
-  spr.print("PWR/IO18 选择  BOOT 切换");
+  spr.print("PWR/IO18 选择  BOOT 确认");
 }
 
-bool pageSettingsTick(PageSettings& s) {
+PageSettingsEvent pageSettingsTick(PageSettings& s) {
   const HwBtn& a    = hwBtnA();     // PWR（中键）
   const HwBtn& b    = hwBtnB();     // IO18（左键）
   const HwBtn& boot = hwBtnBoot();  // BOOT（右键）
@@ -158,10 +171,14 @@ bool pageSettingsTick(PageSettings& s) {
   if (b.wasPressed) s.sel = (int8_t)((s.sel + DONE_SEL) % (DONE_SEL + 1));
 
   if (boot.wasPressed) {
-    if (s.sel == DONE_SEL) return true;
+    if (s.sel == DONE_SEL) return pgDone;
+    if (ROWS[s.sel].kind == ROW_WIFI) {
+      Serial.println("pages: wifi config");
+      return pgWifi;
+    }
     s.mask ^= ROWS[s.sel].bit;
     Serial.printf("pages: %s -> %s\n", ROWS[s.sel].label,
                   (s.mask & ROWS[s.sel].bit) ? "on" : "off");
   }
-  return false;
+  return pgNone;
 }

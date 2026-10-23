@@ -72,12 +72,21 @@ DEVICE_FRESH_SEC = 45.0    # 设备多近来过才算"连着"
 # 必须变：token 必填、只接受白名单动作、默认还要求前台窗口属于 ZCode。
 # 按下设备按钮的那一刻前台是谁不受控，回车打进终端会直接执行已经敲好的命令。
 ACT_TOKEN_FILE = "act.token"
-ACT_NAMES = ("enter", "esc")
+# 动作名 -> (虚拟键, 扫描码, 额外标志)。右 Alt 必须带扩展键标志，否则应用
+# 会把它当成左 Alt / 普通 Alt。
+VK_RETURN = 0x0D
+VK_ESCAPE = 0x1B
+VK_RMENU = 0xA5
+KEYEVENTF_EXTENDEDKEY = 0x0001
+ACT_KEYS = {
+    "enter": (VK_RETURN, 0, 0),
+    "esc":   (VK_ESCAPE, 0, 0),
+    "ralt":  (VK_RMENU, 0x38, KEYEVENTF_EXTENDEDKEY),
+}
+ACT_NAMES = tuple(ACT_KEYS)
 DEFAULT_ACT_APPS = ("zcode.exe",)
 # 设备把 token 拼进 URL 查询串，所以字符集收窄到不用转义的范围
 ACT_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")
-VK_RETURN = 0x0D
-VK_ESCAPE = 0x1B
 KEYEVENTF_KEYUP = 0x0002
 INPUT_KEYBOARD = 1
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -157,17 +166,29 @@ def foreground_app() -> tuple[int, str, str]:
     return int(hwnd), exe, title_s
 
 
-def send_key(vk: int) -> bool:
-    """向当前前台窗口注入一次按键。返回值是 SendInput 是否两条都投递成功。"""
+def send_key(vk: int, scan: int = 0, extra: int = 0, hold_ms: int = 0) -> bool:
+    """向当前前台窗口注入一次按键。返回值是按下/抬起是否都投递成功。
+
+    hold_ms > 0 时在按下和抬起之间等一会儿：真人按键通常有 50-150ms 的持续时间，
+    有些输入法的低级键盘钩子会过滤掉“同一批 SendInput 里按下又抬起”的瞬时事件。
+    """
     user32 = ctypes.WinDLL("user32", use_last_error=True)
     user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int)
     user32.SendInput.restype = wintypes.UINT
-    inputs = (_INPUT * 2)()
-    for i, flags in enumerate((0, KEYEVENTF_KEYUP)):
-        inputs[i].type = INPUT_KEYBOARD
-        inputs[i].ki.wVk = vk
-        inputs[i].ki.dwFlags = flags
-    return user32.SendInput(2, inputs, ctypes.sizeof(_INPUT)) == 2
+
+    def one(flags: int) -> bool:
+        inp = _INPUT()
+        inp.type = INPUT_KEYBOARD
+        inp.ki.wVk = vk
+        inp.ki.wScan = scan
+        inp.ki.dwFlags = extra | flags
+        return user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT)) == 1
+
+    if not one(0):
+        return False
+    if hold_ms > 0:
+        time.sleep(hold_ms / 1000.0)
+    return one(KEYEVENTF_KEYUP)
 
 
 # ZCode 的 Enter 提交处理挂在编辑器 root 上，光标不在输入框里时按键等于按在
@@ -181,17 +202,23 @@ Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes
 $h = [IntPtr]__HWND__
 $root = [System.Windows.Automation.AutomationElement]::FromHandle($h)
 if ($null -eq $root) { 'NO_WINDOW'; exit 2 }
-$cond = New-Object System.Windows.Automation.PropertyCondition(
-  [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-  [System.Windows.Automation.ControlType]::Edit)
-$edits = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
-$best = $null; $bestArea = 0
-foreach ($e in $edits) {
-  $r = $e.Current.BoundingRectangle
-  if ($r.Width -le 100 -or $r.Height -le 16) { continue }
-  if ($e.Current.IsOffscreen -or -not $e.Current.IsEnabled) { continue }
-  $area = $r.Width * $r.Height
-  if ($area -gt $bestArea) { $bestArea = $area; $best = $e }
+$best = $null
+# 快路径：当前焦点本身就是输入框时直接用它。ZCode 的聊天记录很长时，
+# FindAll(Descendants) 会遍历几千个节点，冷启动能超过 2 秒；焦点查询只要几十毫秒。
+$f = [System.Windows.Automation.AutomationElement]::FocusedElement
+if ($null -ne $f -and $f.Current.ControlType -eq [System.Windows.Automation.ControlType]::Edit) {
+  $best = $f
+}
+if ($null -eq $best) {
+  # 慢路径：用 FindFirst 而不是 FindAll，找到一个就停，不收集整棵树。
+  $cond = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+    [System.Windows.Automation.ControlType]::Edit)
+  $e = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
+  if ($null -ne $e) {
+    $r = $e.Current.BoundingRectangle
+    if ($r.Width -gt 100 -and $r.Height -gt 16 -and -not $e.Current.IsOffscreen) { $best = $e }
+  }
 }
 if ($null -eq $best) { 'NO_EDIT'; exit 2 }
 try { $best.SetFocus() } catch { 'FOCUS_FAIL'; exit 3 }
@@ -201,17 +228,34 @@ if ($best.Current.HasKeyboardFocus) { 'OK' } else { 'NO_FOCUS'; exit 4 }
 
 
 def focus_foreground_edit(hwnd: int) -> str:
-    """把前台窗口里最大的可见 Edit 聚焦，返回 OK / NO_EDIT / NO_FOCUS / ...。"""
+    """把前台窗口里的输入框聚焦，返回 OK / NO_EDIT / NO_FOCUS / ...。"""
     script = _FOCUS_PS.replace("__HWND__", str(int(hwnd)))
     try:
         r = subprocess.run(
             ["powershell", "-NoProfile", "-STA", "-Command", script],
-            capture_output=True, text=True, timeout=2.5,
+            capture_output=True, text=True, timeout=6.0,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (OSError, subprocess.TimeoutExpired):
         return "PS_FAIL"
     lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
     return lines[-1] if lines else "PS_FAIL"
+
+
+def warm_uia() -> None:
+    """启动时预热 PowerShell + .NET UIA 程序集。
+
+    冷启动实测要 2.6-2.9 秒，第一次按键会明显变慢；这里只查询焦点元素，
+    不移动焦点、不发键。放到后台线程里做，不拖慢桥接启动。
+    """
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-STA", "-Command",
+             "Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes; "
+             "$null = [System.Windows.Automation.AutomationElement]::FocusedElement"],
+            capture_output=True, text=True, timeout=20,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.TimeoutExpired):
+        pass
 
 
 def load_devices(path) -> list[str]:
@@ -281,17 +325,20 @@ class Bridge:
                       flush=True)
                 return 200, {"ok": True, "dry_run": True, "action": name,
                              "app": exe, "title": title[:80]}
-            if name == "enter":
+            if name in ("enter", "ralt"):
+                # 豆包的语音唤起要求“当前有聚焦的输入框”（它的日志里就写着
+                # 「请点击输入框后再唤起语音」），所以右 Alt 也要先把光标送回
+                # 输入框。enter 更是必须聚焦：光标不在 composer 时按键无效，
+                # 而确认弹窗会吃全局 Enter，盲发可能替用户点掉授权框。
                 focus = focus_foreground_edit(hwnd)
                 if focus != "OK":
-                    # 没聚焦就发 Enter 不只是无效：确认弹窗打开时会替用户点掉
                     print(f"  act focus failed: {focus} (foreground={exe})", flush=True)
                     return 422, {"ok": False, "error": "no focused input", "detail": focus}
-                vk = VK_RETURN
-            else:
-                # Esc 是窗口级按键，不需要输入框焦点（关弹窗/取消正在生成都靠它）
-                vk = VK_ESCAPE
-            if not send_key(vk):
+            vk, scan, extra = ACT_KEYS[name]
+            # 右 Alt 是给输入法语音用的：给一个接近真人按键的持续时间，
+            # 免得被低级键盘钩子当成“瞬时注入”过滤掉。
+            hold = 150 if name == "ralt" else 0
+            if not send_key(vk, scan, extra, hold):
                 print(f"  act {name} failed: SendInput returned an error "
                       f"(foreground={exe})", flush=True)
                 return 500, {"ok": False, "error": "SendInput failed"}
@@ -638,6 +685,8 @@ def main() -> int:
         args.udp_port = 0
 
     bridge = Bridge(args)
+    if args.act_token:
+        threading.Thread(target=warm_uia, daemon=True).start()
 
     # 命令行指定的设备地址并进记忆：这是"设备存着别的网络的桥接地址、自己永远
     # 找不到这里"时的引导办法（设备不会来轮询，桥接也就无从知道它在哪）

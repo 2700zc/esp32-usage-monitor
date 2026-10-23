@@ -148,7 +148,9 @@ AgActCode agSendAct(const char* name, const char* host, uint16_t port,
   snprintf(path, sizeof(path), "/act?name=%s&tok=%s", name, token);
 
   String body;
-  int st = httpGetPlain("act", host, port, path, nullptr, 0, body, 3000);
+  // 聚焦是 PowerShell + UIA：预热后约 0.5-1.5 秒，冷启动实测 2.6-2.9 秒。
+  // 超时给到 6 秒，避免设备先放弃、桥接后脚又把键发出去。
+  int st = httpGetPlain("act", host, port, path, nullptr, 0, body, 6000);
   httpStatus = st;
   switch (st) {
     case 200: return agActOk;

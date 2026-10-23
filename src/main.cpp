@@ -10,6 +10,7 @@
 #include "hw/hw.h"
 #include "hw/net.h"
 #include "hw/gesture.h"
+#include "hw/ble_hid.h"
 #include "wifi_config.h"
 #include <WiFi.h>
 #include <WiFiUdp.h>
@@ -28,10 +29,11 @@ static const uint16_t MAIN_YELLOW = 0xFFE0;
 static const uint32_t REFRESH_ROUND_MS   = 60000;
 static const uint32_t USAGE_FETCH_GAP_MS = 500;
 static const uint32_t CONNECT_TIMEOUT_MS = 10000;  // 自动连接 10 秒超时
-// BOOT 按住这么久进页面设置；短按仍走原来的 WiFi 配置（见 loop 里的按键结算）
-static const uint32_t PAGE_SETTINGS_HOLD_MS = 700;
-// 按键页：IO18 按住这么久 = Esc，短按 = 回车（与 BOOT 进设置页同一节奏）
-static const uint32_t KEY_ACTION_HOLD_MS    = 700;
+// PWR 双击进页面设置：第一下先挂起，等这么久没有第二下才按「刷新」结算。
+// 400ms 足够双击，也把刷新的延迟压在人几乎察觉不到的范围。
+static const uint32_t PWR_DOUBLE_MS      = 400;
+// 按键页：IO18 按住这么久 = Esc，短按 = 回车
+static const uint32_t KEY_ACTION_HOLD_MS = 700;
 
 // Agent 状态页的节奏与上面那轮无关：用量一分钟一变，状态一秒一变。局域网里的
 // 小请求只要几十毫秒；桥接不在时它最多阻塞 1.2 秒，但阻塞的是后台任务。
@@ -91,8 +93,13 @@ static PageSettings s_pgSettings;
 static int8_t   s_pgDrawnSel  = -1;   // 设置页按需重绘：选择/开关变了或超时才画
 static uint8_t  s_pgDrawnMask = 0xFF;
 static uint32_t s_pgDrawMs    = 0;
-// BOOT 长按/短按结算：本次按住是否已按长按处理、本次抬起是否要吞掉短按动作
-static bool     s_bootLongDone = false;
+// 设置页入口（PWR 双击）：第一下挂起，第二下落在窗口内才算双击。
+static bool     s_pwrClickPending = false;
+static uint32_t s_pwrLastClickMs  = 0;
+// 双击的第二下和"进入设置页"发生在同一帧：跳过这一帧的 tick，
+// 否则那一下会立刻把选择行往下移。
+static bool     s_pgSkipTick      = false;
+// BOOT 短按结算：本次抬起是否要吞掉（从 WiFi 配置退出时置位）
 static bool     s_bootSwallow  = false;
 // IO18（按键页）：这次按下是否从普通页面开始、是否已经结算成长按
 static bool     s_keyArmed     = false;
@@ -133,6 +140,8 @@ static DeepSeekUsage     s_netDs;
 
 static volatile bool s_wifiConnected = false;
 static volatile bool s_inWifiConfig  = false;
+// WiFi 配置是从设置页进来的吗？是的话退出后回到设置页，而不是主界面。
+static bool          s_wifiReturnSettings = false;
 static uint32_t      s_wifiConnStart = 0;  // 自动连接开始时刻；0 = 未在自动连接
 static WfConfig      s_wfCfg;
 
@@ -527,16 +536,18 @@ static bool currentPageHasData() {
   return false;
 }
 
-// 物理键触发一次动作：enter 在桥接侧要先聚焦输入框，Esc 直接注入。请求期间
-// 主循环会被占住，所以当前正停在按键页时先把"正在发送"画出来；在别的页面
-// 就不打断那一页，结果留在按键页上等用户回去看。
-static void sendActionFromKey(bool esc) {
+// 物理键触发一次动作（0=回车，1=Esc，2=右 Alt）。enter 在桥接侧要先聚焦
+// 输入框，Esc / 右 Alt 直接注入。请求期间主循环会被占住，所以当前正停在
+// 按键页时先把"正在发送"画出来；在别的页面就不打断那一页，结果留在按键页上。
+static void sendAction(int8_t action) {
+  static const char* const NAMES[3] = { "enter", "esc", "ralt" };
+  if (action < 0 || action > 2) action = 0;
   const bool connected = s_wifiConnected;
   String ip = connected ? WiFi.localIP().toString() : String();
   const bool onPage = (s_pageCount > 0 && s_pages[s_page] == Prov::Send);
 
   s_sendUi.busy       = true;
-  s_sendUi.busyAction = esc ? 1 : 0;
+  s_sendUi.busyAction = action;
   if (onPage) {
     drawCurrentPage(ip.c_str(), connected ? nullptr : "网络断开");
     hwDisplayPush();
@@ -544,18 +555,43 @@ static void sendActionFromKey(bool esc) {
 
   int httpStatus = 0;
   AgActCode rc = connected
-                   ? agSendAct(esc ? "esc" : "enter", s_agentHost, s_agentPort,
+                   ? agSendAct(NAMES[action], s_agentHost, s_agentPort,
                                s_cfg.act_token, httpStatus)
                    : agActNetwork;
 
   s_sendUi.busy       = false;
   s_sendUi.result     = (int8_t)rc;
-  s_sendUi.lastAction = esc ? 1 : 0;
+  s_sendUi.lastAction = action;
   s_sendUi.atMs       = millis();
   if (onPage) s_lastDrawMs = 0;   // 让按需重绘块立刻画出结果
-  Serial.printf("act: %s %s (http=%d, bridge=%s:%u)\n", esc ? "esc" : "enter",
+  Serial.printf("act: %s %s (http=%d, bridge=%s:%u)\n", NAMES[action],
                 agActName(rc), httpStatus, s_agentHost[0] ? s_agentHost : "-",
                 (unsigned)s_agentPort);
+}
+
+static void sendRightAlt() {
+  // 右 Alt 优先走 BLE HID：豆包等程序会过滤 SendInput 注入，只有真实 HID
+  // 报文才认。未配对/未连接时回退到桥接注入（对不过滤注入的程序仍然有效）。
+  if (bleHidReady()) {
+    const bool connected = s_wifiConnected;
+    String ip = connected ? WiFi.localIP().toString() : String();
+    const bool onPage = (s_pageCount > 0 && s_pages[s_page] == Prov::Send);
+    s_sendUi.busy       = true;
+    s_sendUi.busyAction = 2;
+    if (onPage) {
+      drawCurrentPage(ip.c_str(), connected ? nullptr : "网络断开");
+      hwDisplayPush();
+    }
+    bleHidTapRightAlt();
+    s_sendUi.busy       = false;
+    s_sendUi.result     = (int8_t)agActOk;
+    s_sendUi.lastAction = 2;
+    s_sendUi.atMs       = millis();
+    if (onPage) s_lastDrawMs = 0;
+    Serial.println("act: ralt ble");
+  } else {
+    sendAction(2);
+  }
 }
 
 void setup() {
@@ -580,6 +616,9 @@ void setup() {
   // token 只报有没有，绝不打印内容
   Serial.printf("boot: act_token %s\n", s_cfg.act_token[0] ? "configured" : "missing");
 
+  // BLE 键盘与 WiFi 共存：右 Alt 走 BLE，状态页/回车/Esc 仍走 WiFi。
+  if (!bleHidInit()) Serial.println("boot: ble init failed");
+
   // 网络请求全部放在 core 0 的后台任务里；loop() 只负责触摸和绘制。
   if (xTaskCreatePinnedToCore(agentNetTask, "agent_net", 8192, nullptr, 1, nullptr, 0) != pdPASS)
     Serial.println("boot: agent task create failed");
@@ -600,6 +639,7 @@ void setup() {
 
 void loop() {
   hwInputUpdate();
+  bleHidTick();   // 连接期间每 5 秒补一个空报告，保持 HID 通知通道
 
   // 自动旋转。放在触摸之后、手势之前：方向一变，手势层会作废正在进行的滑动。
   // MADCTL 改向后面板会立刻把现有帧转过来，但主界面是按需重绘的，这里强制
@@ -655,42 +695,55 @@ void loop() {
     Serial.printf("swipe: -> page %d/%d\n", s_page + 1, s_pageCount);
   }
 
-  // PWR 键：已连接时立刻刷一轮（顺带把状态页也立刻重试，不用等退避）；
-  // 自动连接等待中则直接进入 WiFi 配置。设置页里它用来选行，不触发刷新。
-  if (hwBtnA().wasPressed && !s_inWifiConfig && !s_inPageSettings) {
-    if (s_wifiConnected) {
-      s_cmdRefresh  = true;
-      s_cmdAgentNow = true;
-      s_cmdProbeNow = true;
-    } else if (s_wifiConnStart != 0) {
-      s_wifiConnStart = 0;
-      s_inWifiConfig = true;
-      wfInit(s_wfCfg);
+  // PWR 键：单击 = 刷新（先等 400ms 确认没有第二下）；双击 = 进入页面设置。
+  // 设置页 / WiFi 配置里 PWR 用来选行，不参与这套结算。
+  {
+    const bool modes = s_inWifiConfig || s_inPageSettings;
+    const HwBtn& pwr = hwBtnA();
+    if (pwr.wasPressed && !modes) {
+      if (s_pwrClickPending && millis() - s_pwrLastClickMs <= PWR_DOUBLE_MS) {
+        s_pwrClickPending = false;          // 这是双击，取消挂起的刷新
+        s_inPageSettings  = true;
+        pageSettingsInit(s_pgSettings, s_pageMask);
+        s_pgSkipTick = true;                // 吞掉这一下 PWR，别立刻移选择行
+        s_pgDrawnSel = -1;
+        s_pgDrawMs   = 0;
+        Serial.println("pages: settings opened (pwr x2)");
+      } else {
+        s_pwrClickPending = true;
+        s_pwrLastClickMs  = millis();
+      }
     }
+    if (s_pwrClickPending && !modes &&
+        millis() - s_pwrLastClickMs >= PWR_DOUBLE_MS) {
+      s_pwrClickPending = false;
+      if (s_wifiConnected) {
+        s_cmdRefresh  = true;
+        s_cmdAgentNow = true;
+        s_cmdProbeNow = true;
+      } else if (s_wifiConnStart != 0) {
+        s_wifiConnStart = 0;
+        s_inWifiConfig  = true;
+        wfInit(s_wfCfg);
+      }
+    }
+    if (modes) s_pwrClickPending = false;
   }
 
-  // BOOT 键：短按进 WiFi 配置，长按进页面开关。长按得按住等到阈值，所以短按
-  // 改在抬起时结算；已经按长按处理过的这次按住，抬手不再触发短按动作。
+  // BOOT 键：短按在按键页开启时发「右 Alt」，按键页关闭时保留 WiFi 配置
+  // 快捷入口。长按不再绑定设置页（入口已迁到 PWR 双击），长按槽位空出来
+  // 留给后续动作。
   {
     const HwBtn& boot = hwBtnBoot();
-    if (boot.wasPressed) {
-      s_bootLongDone = false;
-      s_bootSwallow  = false;
-    }
-    if (!s_inWifiConfig && !s_inPageSettings && boot.isPressed &&
-        !s_bootLongDone && boot.pressedFor(PAGE_SETTINGS_HOLD_MS)) {
-      s_bootLongDone   = true;
-      s_bootSwallow    = true;
-      s_inPageSettings = true;
-      pageSettingsInit(s_pgSettings, s_pageMask);
-      s_pgDrawnSel = -1;
-      s_pgDrawMs   = 0;
-      Serial.println("pages: settings opened");
-    }
+    if (boot.wasPressed) s_bootSwallow = false;
     if (!s_inWifiConfig && !s_inPageSettings && boot.wasReleased) {
-      if (!s_bootLongDone && !s_bootSwallow) {
-        s_inWifiConfig = true;
-        wfInit(s_wfCfg);
+      if (!s_bootSwallow) {
+        if (s_pageMask & PG_SEND) {
+          sendRightAlt();              // 按键页开启：短按 = 右 Alt
+        } else {
+          s_inWifiConfig = true;       // 按键页关闭：保留 WiFi 快捷入口
+          wfInit(s_wfCfg);
+        }
       }
       s_bootSwallow = false;
     }
@@ -709,11 +762,11 @@ void loop() {
     if (!modes && (s_pageMask & PG_SEND) && s_keyArmed && key.isPressed &&
         !s_keyLongDone && key.pressedFor(KEY_ACTION_HOLD_MS)) {
       s_keyLongDone = true;
-      sendActionFromKey(true);          // 长按 = Esc（桥接侧直接注入，不聚焦）
+      sendAction(1);                    // 长按 = Esc（桥接侧直接注入，不聚焦）
     }
     if (key.wasReleased) {
       if (!modes && (s_pageMask & PG_SEND) && s_keyArmed && !s_keyLongDone) {
-        sendActionFromKey(false);       // 短按 = 回车（桥接侧先聚焦输入框）
+        sendAction(0);                  // 短按 = 回车（桥接侧先聚焦输入框）
       }
       s_keyArmed    = false;
       s_keyLongDone = false;
@@ -722,11 +775,16 @@ void loop() {
 
   // ── 页面开关 ──
   if (s_inPageSettings) {
-    if (pageSettingsTick(s_pgSettings)) {
-      // 这次 BOOT 已经用来按「完成」了：抬手别再开 WiFi 配置，按住不放也
-      // 别在退出后的下一帧又被长按判定抓回设置页。
+    PageSettingsEvent ev = pgNone;
+    if (s_pgSkipTick) {
+      // 双击的第二下就是进入设置页的那一下，跳过它，别立刻移动选择行
+      s_pgSkipTick = false;
+    } else {
+      ev = pageSettingsTick(s_pgSettings);
+    }
+    if (ev == pgDone) {
+      // 这次 BOOT 已经用来按「完成」了：抬手别再开 WiFi 配置。
       s_bootSwallow    = true;
-      s_bootLongDone   = true;
       s_inPageSettings = false;
       (void)hwSwipePoll();          // 设置页期间没跑手势层，清掉可能残留的滑动
       if (s_pgSettings.mask != s_pageMask) {
@@ -745,6 +803,16 @@ void loop() {
       }
       s_drawnPage  = -1;
       s_lastDrawMs = 0;
+    } else if (ev == pgWifi) {
+      // 从设置页进 WiFi 配置。设置状态（含未保存的开关改动）留着，
+      // 退出 WiFi 后回到设置页再按「完成」。
+      s_inPageSettings     = false;
+      s_inWifiConfig       = true;
+      s_wifiReturnSettings = true;
+      wfInit(s_wfCfg);
+      s_drawnPage  = -1;
+      s_lastDrawMs = 0;
+      Serial.println("wifi: config from page settings");
     } else {
       const bool due = (s_pgDrawnSel != s_pgSettings.sel) ||
                        (s_pgDrawnMask != s_pgSettings.mask) ||
@@ -771,10 +839,27 @@ void loop() {
       s_netGen++;
       s_cmdRefresh = true;
       s_inWifiConfig = false;
-      s_drawnPage = -1;          // 退出配置界面后强制重画主界面
+      // 用 BOOT 结束配置时抬手别再被判成一次短按（否则会立刻重进 WiFi 配置）
+      s_bootSwallow  = true;
+      if (s_wifiReturnSettings) {
+        s_inPageSettings     = true;
+        s_wifiReturnSettings = false;
+        s_pgDrawnSel = -1;       // 回设置页，保留原来的选择/开关改动
+        s_pgDrawMs   = 0;
+      } else {
+        s_drawnPage = -1;        // 退出配置界面后强制重画主界面
+      }
     } else if (done) {
       s_inWifiConfig = false;
-      s_drawnPage = -1;
+      s_bootSwallow  = true;
+      if (s_wifiReturnSettings) {
+        s_inPageSettings     = true;
+        s_wifiReturnSettings = false;
+        s_pgDrawnSel = -1;
+        s_pgDrawMs   = 0;
+      } else {
+        s_drawnPage = -1;
+      }
     }
     wfDraw(s_wfCfg);
     hwDisplayPush();

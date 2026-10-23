@@ -24,9 +24,9 @@ void usageDisplayDrawCc(const CommandCodeUsage& data, const char* ip, int page, 
 // （短按回车、长按 Esc），触摸页只做说明，避免触摸坐标在旋转后的命中问题。
 struct SendUiState {
   bool     busy;        // 请求在途
-  int8_t   busyAction;  // 0 = 回车，1 = Esc
+  int8_t   busyAction;  // 0 = 回车，1 = Esc，2 = 右 Alt
   int8_t   result;      // AgActCode；-1 = 还没按过
-  int8_t   lastAction;  // 最近一次动作：0 = 回车，1 = Esc
+  int8_t   lastAction;  // 最近一次动作：0 = 回车，1 = Esc，2 = 右 Alt
   uint32_t atMs;        // 结果产生时的 millis（用于「N 分钟前」）
 };
 

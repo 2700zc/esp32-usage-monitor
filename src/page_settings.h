@@ -21,9 +21,17 @@ void    pageMaskSave(uint8_t mask);  // 调用方保证值确实变了
 
 struct PageSettings {
   uint8_t mask;      // PG_* 位组合
-  int8_t  sel;       // 0..4 = 页面，5 = 完成
+  int8_t  sel;       // 0..5 = 设置项，6 = 完成
+};
+
+// 设置页的动作结果。WiFi 配置也收在这一页里，BOOT 在 WiFi 行上是「进入」
+// 而不是切换，所以不能再用 bool 表示（true 只代表「完成」）。
+enum PageSettingsEvent : uint8_t {
+  pgNone = 0,
+  pgDone,            // 选了「完成」，调用方保存 mask 并退出
+  pgWifi,            // 选了「WiFi 配置」，调用方打开 WiFi 配置界面
 };
 
 void pageSettingsInit(PageSettings& s, uint8_t mask);
 void pageSettingsDraw(const PageSettings& s, const AppConfig& cfg);
-bool pageSettingsTick(PageSettings& s);   // true = 选了「完成」，请求退出
+PageSettingsEvent pageSettingsTick(PageSettings& s);
