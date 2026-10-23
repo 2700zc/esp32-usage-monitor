@@ -25,7 +25,7 @@ static bool looksLikeSession(const char* s, size_t n) {
 
 // 从填进来的凭据里取出 __Host-console_session 的值，三种写法都认（与 TokenHub
 // 的 extract_console_session 一致）：
-//   1. 裸值           st_6d1759dd-3b3f-4c79-b109-40163b463cf3
+//   1. 裸值           st_00000000-0000-4000-8000-000000000000
 //   2. 整串 cookie    oc_locale=zh; __Host-console_session=st_…; __stripe_mid=…
 //   3. 整条 curl      （cookie 名可能跨行，靠名字定位即可）
 // 旧版的 auth=Fe26.2**（_server 接口那套）不在识别范围内：那个接口 2026-10 起

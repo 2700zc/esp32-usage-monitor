@@ -145,6 +145,13 @@ def customer_readme(version: str) -> str:
 3. 看到 "刷入完成" 后，板子会自动重启并进入 WiFi 配置界面：
    PWR / IO18 选择，BOOT 确认。
 
+日常使用：
+- 左右滑动切换页面；PWR（中键）随时刷新用量。
+- 长按 BOOT 约 0.7 秒进入页面开关：PWR / IO18 选行，BOOT 切换，
+  选「完成」再按 BOOT 保存并返回。关掉的页面不再显示，也不再请求用量
+  （过期凭据不会反复报错）。
+- 短按 BOOT 仍然是 WiFi 配置界面。
+
 这个包只包含固件，不包含任何账号凭据。
 用量页（DeepSeek / OpenCode / CommandCode）需要另外填凭据，
 见仓库 README 的"配置详解"。
