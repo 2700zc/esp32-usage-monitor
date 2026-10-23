@@ -106,10 +106,16 @@ SwipeDir hwSwipePoll() {
 
   // 抬手。input.cpp 的抬起有 40ms 去抖，所以通常已经在上面的分支里结算过了；
   // 这里兜住「最后一帧才越过阈值、还没被采到就抬手」的情况。
+  //
+  // 只有真的判出方向才置 s_fired：它表示"这次按下已经结算成滑动"。抬手时
+  // 无条件置真的话，"没滑动的按下"也会被标成已结算，语义就不对了。
   s_active = false;
   if (!s_fired && millis() - s_startMs <= SWIPE_ARM_MS) {
-    s_fired = true;
-    return evaluateSwipe();
+    SwipeDir dir = evaluateSwipe();
+    if (dir != SwipeDir::None) {
+      s_fired = true;
+      return dir;
+    }
   }
   return SwipeDir::None;
 }

@@ -30,6 +30,8 @@ static const uint32_t USAGE_FETCH_GAP_MS = 500;
 static const uint32_t CONNECT_TIMEOUT_MS = 10000;  // 自动连接 10 秒超时
 // BOOT 按住这么久进页面设置；短按仍走原来的 WiFi 配置（见 loop 里的按键结算）
 static const uint32_t PAGE_SETTINGS_HOLD_MS = 700;
+// 按键页：IO18 按住这么久 = Esc，短按 = 回车（与 BOOT 进设置页同一节奏）
+static const uint32_t KEY_ACTION_HOLD_MS    = 700;
 
 // Agent 状态页的节奏与上面那轮无关：用量一分钟一变，状态一秒一变。局域网里的
 // 小请求只要几十毫秒；桥接不在时它最多阻塞 1.2 秒，但阻塞的是后台任务。
@@ -73,17 +75,17 @@ static volatile bool     s_cmdProbeNow = false;
 static volatile uint32_t s_netGen      = 0;   // 每次连上 WiFi +1，任务据此重绑 UDP
 
 // 页面顺序：Agent 状态在最前，其余三家与 TokenHub 一致（OpenCode Go →
-// CommandCode → DeepSeek）。没配齐凭据的服务商不生成页面（只配了 DeepSeek
-// 就仍是单页，滑动无效果）；页面开关关掉的服务商同样不生成——s_pages 同时
-// 驱动绘制和 60 秒抓取轮次，所以"不显示"天然等于"不再请求"。
-enum class Prov : uint8_t { Agent, Oc, Cc, Ds };
-static Prov s_pages[4];
+// CommandCode → DeepSeek），实验性的按键页放最后。没配齐凭据的服务商不生成
+// 页面（只配了 DeepSeek 就仍是单页，滑动无效果）；页面开关关掉的同样不生成——
+// s_pages 同时驱动绘制和 60 秒抓取轮次，所以"不显示"天然等于"不再请求"。
+enum class Prov : uint8_t { Agent, Oc, Cc, Ds, Send };
+static Prov s_pages[5];
 static int  s_pageCount = 0;
 static int  s_page      = 0;
 
 // 页面开关（NVS 持久化）。隐藏的服务商从 s_pages 里消失，用量任务就不会再
 // 抓它；Agent 任务另有开关判断，见 agentNetTask。
-static uint8_t  s_pageMask      = PG_ALL;
+static uint8_t  s_pageMask      = PG_DEFAULT;
 static bool     s_inPageSettings = false;
 static PageSettings s_pgSettings;
 static int8_t   s_pgDrawnSel  = -1;   // 设置页按需重绘：选择/开关变了或超时才画
@@ -92,6 +94,9 @@ static uint32_t s_pgDrawMs    = 0;
 // BOOT 长按/短按结算：本次按住是否已按长按处理、本次抬起是否要吞掉短按动作
 static bool     s_bootLongDone = false;
 static bool     s_bootSwallow  = false;
+// IO18（按键页）：这次按下是否从普通页面开始、是否已经结算成长按
+static bool     s_keyArmed     = false;
+static bool     s_keyLongDone  = false;
 
 // ── Agent 发现/轮询状态（只在 agentNetTask 里读写）──
 static WiFiUDP  s_agentUdp;
@@ -136,6 +141,10 @@ static uint32_t s_lastDrawMs      = 0;
 static int      s_drawnPage       = -1;
 static bool     s_drawnConnected  = false;
 
+// 按键页的状态：物理键触发 -> 同步发一次请求 -> 显示结果。没有后台任务，
+// 因为这是用户主动触发的一次性动作，结果必须和这次按下一一对应。
+static SendUiState s_sendUi = { false, 0, -1, 0, 0 };
+
 static void buildPages(const AppConfig& c) {
   s_pageCount = 0;
   // 状态页放第一页：它是唯一"此刻正在发生"的一页，开机默认停在它上面才有意义
@@ -144,6 +153,7 @@ static void buildPages(const AppConfig& c) {
   if ((s_pageMask & PG_OC) && cfgOcReady(c)) s_pages[s_pageCount++] = Prov::Oc;
   if ((s_pageMask & PG_CC) && cfgCcReady(c)) s_pages[s_pageCount++] = Prov::Cc;
   if ((s_pageMask & PG_DS) && cfgDsReady(c)) s_pages[s_pageCount++] = Prov::Ds;
+  if (s_pageMask & PG_SEND)                  s_pages[s_pageCount++] = Prov::Send;
   if (s_page >= s_pageCount) s_page = 0;
 }
 
@@ -339,9 +349,10 @@ static void agentNetTask(void*) {
       vTaskDelay(pdMS_TO_TICKS(100));
       continue;
     }
-    // 状态页被关掉时不进局域网找桥接、也不轮询（UDP 推送没人看）。重新打开
-    // 时把节奏归零，立刻取一次而不是等下一次退避。
-    if (!(s_pageMask & PG_AGENT)) {
+    // 状态页被关掉时不进局域网找桥接、也不轮询（UDP 推送没人看）。按键页
+    // 也要桥接地址和连通性，所以它打开时这条链路必须继续跑。重新打开时把
+    // 节奏归零，立刻取一次而不是等下一次退避。
+    if (!(s_pageMask & (PG_AGENT | PG_SEND))) {
       pageOn = false;
       vTaskDelay(pdMS_TO_TICKS(200));
       continue;
@@ -475,8 +486,9 @@ static void usageNetTask(void*) {
       case Prov::Cc: ccFetch(s_netCc, s_cfg.cc_cookie); break;
       case Prov::Ds: dsFetchToday(s_netDs, s_cfg.ds_token); break;
       // 状态页不进 60 秒轮次：它按秒更新（见 agentNetTask），塞进轮次里只会
-      // 让状态最多滞后一分钟。
+      // 让状态最多滞后一分钟。按键页也没有要定时抓的数据。
       case Prov::Agent: break;
+      case Prov::Send:  break;
     }
     publishUsage();
     vTaskDelay(pdMS_TO_TICKS(USAGE_FETCH_GAP_MS));
@@ -497,6 +509,7 @@ static void drawCurrentPage(const char* ip, const char* netStatus) {
     case Prov::Oc: usageDisplayDrawOc(s_oc, ip, s_page, s_pageCount, netStatus); break;
     case Prov::Cc: usageDisplayDrawCc(s_cc, ip, s_page, s_pageCount, netStatus); break;
     case Prov::Ds: usageDisplayDrawDs(s_ds, ip, s_page, s_pageCount, netStatus); break;
+    case Prov::Send: usageDisplayDrawSend(s_agent, s_sendUi, ip, s_page, s_pageCount, netStatus); break;
   }
 }
 
@@ -508,8 +521,41 @@ static bool currentPageHasData() {
     case Prov::Oc: return s_oc.valid;
     case Prov::Cc: return s_cc.valid;
     case Prov::Ds: return s_ds.valid;
+    // 按键页没有"缓存数据"一说：断网时也要留在这一页，按下去会明确报连不上
+    case Prov::Send: return true;
   }
   return false;
+}
+
+// 物理键触发一次动作：enter 在桥接侧要先聚焦输入框，Esc 直接注入。请求期间
+// 主循环会被占住，所以当前正停在按键页时先把"正在发送"画出来；在别的页面
+// 就不打断那一页，结果留在按键页上等用户回去看。
+static void sendActionFromKey(bool esc) {
+  const bool connected = s_wifiConnected;
+  String ip = connected ? WiFi.localIP().toString() : String();
+  const bool onPage = (s_pageCount > 0 && s_pages[s_page] == Prov::Send);
+
+  s_sendUi.busy       = true;
+  s_sendUi.busyAction = esc ? 1 : 0;
+  if (onPage) {
+    drawCurrentPage(ip.c_str(), connected ? nullptr : "网络断开");
+    hwDisplayPush();
+  }
+
+  int httpStatus = 0;
+  AgActCode rc = connected
+                   ? agSendAct(esc ? "esc" : "enter", s_agentHost, s_agentPort,
+                               s_cfg.act_token, httpStatus)
+                   : agActNetwork;
+
+  s_sendUi.busy       = false;
+  s_sendUi.result     = (int8_t)rc;
+  s_sendUi.lastAction = esc ? 1 : 0;
+  s_sendUi.atMs       = millis();
+  if (onPage) s_lastDrawMs = 0;   // 让按需重绘块立刻画出结果
+  Serial.printf("act: %s %s (http=%d, bridge=%s:%u)\n", esc ? "esc" : "enter",
+                agActName(rc), httpStatus, s_agentHost[0] ? s_agentHost : "-",
+                (unsigned)s_agentPort);
 }
 
 void setup() {
@@ -527,9 +573,12 @@ void setup() {
   loadConfig(s_cfg);
   buildPages(s_cfg);
   agentSeedFromConfig();
-  Serial.printf("boot: %d page(s), mask=0x%02X (agent=%d oc=%d cc=%d ds=%d)\n",
+  Serial.printf("boot: %d page(s), mask=0x%02X (agent=%d oc=%d cc=%d ds=%d send=%d)\n",
                 s_pageCount, s_pageMask, (int)cfgAgentReady(s_cfg), (int)cfgOcReady(s_cfg),
-                (int)cfgCcReady(s_cfg), (int)cfgDsReady(s_cfg));
+                (int)cfgCcReady(s_cfg), (int)cfgDsReady(s_cfg),
+                (int)((s_pageMask & PG_SEND) != 0));
+  // token 只报有没有，绝不打印内容
+  Serial.printf("boot: act_token %s\n", s_cfg.act_token[0] ? "configured" : "missing");
 
   // 网络请求全部放在 core 0 的后台任务里；loop() 只负责触摸和绘制。
   if (xTaskCreatePinnedToCore(agentNetTask, "agent_net", 8192, nullptr, 1, nullptr, 0) != pdPASS)
@@ -644,6 +693,30 @@ void loop() {
         wfInit(s_wfCfg);
       }
       s_bootSwallow = false;
+    }
+  }
+
+  // IO18（左侧键）：按键页功能打开时，短按 = 回车，长按 0.7 秒 = Esc。
+  // 设置页和 WiFi 配置页里 IO18 要选行，必须排除；如果这次按下发生在那些
+  // 界面里（s_keyArmed 没置位），退出后即使还按着也不会"补发"。
+  {
+    const bool modes = s_inWifiConfig || s_inPageSettings;
+    const HwBtn& key = hwBtnB();
+    if (key.wasPressed) {
+      s_keyArmed    = !modes;
+      s_keyLongDone = false;
+    }
+    if (!modes && (s_pageMask & PG_SEND) && s_keyArmed && key.isPressed &&
+        !s_keyLongDone && key.pressedFor(KEY_ACTION_HOLD_MS)) {
+      s_keyLongDone = true;
+      sendActionFromKey(true);          // 长按 = Esc（桥接侧直接注入，不聚焦）
+    }
+    if (key.wasReleased) {
+      if (!modes && (s_pageMask & PG_SEND) && s_keyArmed && !s_keyLongDone) {
+        sendActionFromKey(false);       // 短按 = 回车（桥接侧先聚焦输入框）
+      }
+      s_keyArmed    = false;
+      s_keyLongDone = false;
     }
   }
 

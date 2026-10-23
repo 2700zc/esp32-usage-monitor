@@ -133,3 +133,44 @@ bool agFetchHost(AgentStatus& out, const char* host, uint16_t port, const char* 
   }
   return agApply(out, body.c_str(), false);
 }
+
+// ── 动作接口 ──
+// 只发预定义名字，token 走查询串（桥接同时校验）。失败按 HTTP 码分类，屏幕上
+// 要能区分"令牌不对"和"前台不是 ZCode"——两者的补救方式完全不同。
+AgActCode agSendAct(const char* name, const char* host, uint16_t port,
+                    const char* token, int& httpStatus) {
+  httpStatus = 0;
+  if (!name || !name[0])   return agActFailed;
+  if (!token || !token[0]) return agActNoToken;
+  if (!host || !host[0])   return agActNoHost;
+
+  char path[128];
+  snprintf(path, sizeof(path), "/act?name=%s&tok=%s", name, token);
+
+  String body;
+  int st = httpGetPlain("act", host, port, path, nullptr, 0, body, 3000);
+  httpStatus = st;
+  switch (st) {
+    case 200: return agActOk;
+    case 0:   return agActNetwork;
+    case 403: return agActDenied;
+    case 404: return agActOldBridge;
+    case 409: return agActForeground;
+    case 422: return agActNoEdit;
+    default:  return agActFailed;
+  }
+}
+
+const char* agActName(AgActCode code) {
+  switch (code) {
+    case agActOk:         return "ok";
+    case agActNoToken:    return "no token";
+    case agActNoHost:     return "no bridge";
+    case agActNetwork:    return "network";
+    case agActDenied:     return "denied";
+    case agActForeground: return "foreground";
+    case agActNoEdit:     return "no focused input";
+    case agActOldBridge:  return "old bridge";
+    default:              return "failed";
+  }
+}

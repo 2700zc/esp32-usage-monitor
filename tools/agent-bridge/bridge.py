@@ -16,13 +16,19 @@ install (the packaged Python 3.14 that ships with the dev box is fine).
 from __future__ import annotations
 
 import argparse
+import ctypes
+import hmac
 import json
 import os
+import re
 import socket
+import subprocess
 import sys
 import threading
 import time
+from ctypes import wintypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
 # ── state model ──────────────────────────────────────────────────────────
 # waiting > tool > thinking > done > idle: when several ZCode sessions are
@@ -61,6 +67,152 @@ ANNOUNCE_IDLE_SEC = 10.0   # 设备多久没来轮询就再喊一次
 ANNOUNCE_POLL_SEC = 5.0    # 多久检查一次"设备还在不在"
 DEVICE_FRESH_SEC = 45.0    # 设备多近来过才算"连着"
 
+# ── 动作接口（设备 -> PC 注入按键）──────────────────────────────────────
+# /agent 是局域网明文、无鉴权的只读接口；/act 会让 PC 真的动起来，安全模型
+# 必须变：token 必填、只接受白名单动作、默认还要求前台窗口属于 ZCode。
+# 按下设备按钮的那一刻前台是谁不受控，回车打进终端会直接执行已经敲好的命令。
+ACT_TOKEN_FILE = "act.token"
+ACT_NAMES = ("enter", "esc")
+DEFAULT_ACT_APPS = ("zcode.exe",)
+# 设备把 token 拼进 URL 查询串，所以字符集收窄到不用转义的范围
+ACT_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")
+VK_RETURN = 0x0D
+VK_ESCAPE = 0x1B
+KEYEVENTF_KEYUP = 0x0002
+INPUT_KEYBOARD = 1
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+
+def load_act_token(cli_value: str | None) -> str:
+    """CLI 优先，其次读脚本旁边的 act.token。非法值当作没配置。"""
+    if cli_value is not None:
+        tok = cli_value.strip()
+        source = "--act-token"
+    else:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ACT_TOKEN_FILE)
+        try:
+            with open(path, encoding="utf-8") as f:
+                tok = f.readline().strip()
+            source = ACT_TOKEN_FILE
+        except OSError:
+            return ""
+    if not ACT_TOKEN_RE.fullmatch(tok):
+        print(f"!! {source} ignored: a token must be 8-64 chars of [A-Za-z0-9_-]",
+              file=sys.stderr, flush=True)
+        return ""
+    return tok
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", wintypes.WORD),
+                ("wScan", wintypes.WORD),
+                ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                # ULONG_PTR：64 位下必须是指针大小，否则结构体布局对不上
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    # INPUT 的 union 要按"最大的成员"算大小；只放 KEYBDINPUT 会让 sizeof(INPUT)
+    # 变成 32，而 Windows x64 期望 40，SendInput 会报参数错误、一次也发不出去。
+    _fields_ = [("dx", wintypes.LONG),
+                ("dy", wintypes.LONG),
+                ("mouseData", wintypes.DWORD),
+                ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+
+class _INPUT(ctypes.Structure):
+    class _Union(ctypes.Union):
+        _fields_ = [("ki", _KEYBDINPUT), ("mi", _MOUSEINPUT)]
+
+    _anonymous_ = ("u",)
+    _fields_ = [("type", wintypes.DWORD), ("u", _Union)]
+
+
+def foreground_app() -> tuple[int, str, str]:
+    """(hwnd, exe 文件名小写, 窗口标题)。取不到 exe 时留空。"""
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32.GetForegroundWindow.restype = ctypes.c_void_p
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return 0, "", ""
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(ctypes.c_void_p(hwnd), ctypes.byref(pid))
+    title = ctypes.create_unicode_buffer(512)
+    n = user32.GetWindowTextW(ctypes.c_void_p(hwnd), title, len(title))
+    title_s = title.value if n > 0 else ""
+
+    exe = ""
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+    if h:
+        path = ctypes.create_unicode_buffer(1024)
+        size = wintypes.DWORD(len(path))
+        if kernel32.QueryFullProcessImageNameW(h, 0, path, ctypes.byref(size)):
+            exe = os.path.basename(path.value).lower()
+        kernel32.CloseHandle(ctypes.c_void_p(h))
+    return int(hwnd), exe, title_s
+
+
+def send_key(vk: int) -> bool:
+    """向当前前台窗口注入一次按键。返回值是 SendInput 是否两条都投递成功。"""
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int)
+    user32.SendInput.restype = wintypes.UINT
+    inputs = (_INPUT * 2)()
+    for i, flags in enumerate((0, KEYEVENTF_KEYUP)):
+        inputs[i].type = INPUT_KEYBOARD
+        inputs[i].ki.wVk = vk
+        inputs[i].ki.dwFlags = flags
+    return user32.SendInput(2, inputs, ctypes.sizeof(_INPUT)) == 2
+
+
+# ZCode 的 Enter 提交处理挂在编辑器 root 上，光标不在输入框里时按键等于按在
+# 空白处；全前端唯一一个全局 Enter 还是确认弹窗。所以注入前必须先聚焦输入框，
+# 而且是"确认 HasKeyboardFocus 为真"才发键。这里用系统自带的 PowerShell + UIA，
+# 不引入任何第三方包（刷机包承诺客户只装 Python 3）。
+# 选最大面积的可见 Edit：ZCode 的 composer 是 Lexical contenteditable，UIA 里
+# 表现为 ControlType.Edit，Name 是占位符文案（会变），不能按名字匹配。
+_FOCUS_PS = r"""
+Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes
+$h = [IntPtr]__HWND__
+$root = [System.Windows.Automation.AutomationElement]::FromHandle($h)
+if ($null -eq $root) { 'NO_WINDOW'; exit 2 }
+$cond = New-Object System.Windows.Automation.PropertyCondition(
+  [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+  [System.Windows.Automation.ControlType]::Edit)
+$edits = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
+$best = $null; $bestArea = 0
+foreach ($e in $edits) {
+  $r = $e.Current.BoundingRectangle
+  if ($r.Width -le 100 -or $r.Height -le 16) { continue }
+  if ($e.Current.IsOffscreen -or -not $e.Current.IsEnabled) { continue }
+  $area = $r.Width * $r.Height
+  if ($area -gt $bestArea) { $bestArea = $area; $best = $e }
+}
+if ($null -eq $best) { 'NO_EDIT'; exit 2 }
+try { $best.SetFocus() } catch { 'FOCUS_FAIL'; exit 3 }
+Start-Sleep -Milliseconds 80
+if ($best.Current.HasKeyboardFocus) { 'OK' } else { 'NO_FOCUS'; exit 4 }
+"""
+
+
+def focus_foreground_edit(hwnd: int) -> str:
+    """把前台窗口里最大的可见 Edit 聚焦，返回 OK / NO_EDIT / NO_FOCUS / ...。"""
+    script = _FOCUS_PS.replace("__HWND__", str(int(hwnd)))
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-STA", "-Command", script],
+            capture_output=True, text=True, timeout=2.5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.TimeoutExpired):
+        return "PS_FAIL"
+    lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+    return lines[-1] if lines else "PS_FAIL"
+
 
 def load_devices(path) -> list[str]:
     try:
@@ -87,11 +239,64 @@ class Bridge:
         self.device_ip: str | None = None
         self.device_seen = 0.0
         self.last_push_seq = -1
+        self.act_lock = threading.Lock()   # 两次按键注入不能交错
         self.udp_out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.state_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), STATE_FILE)
         self.known_devices = load_devices(self.state_path)
         if self.known_devices:
             print(f"remembered device(s): {', '.join(self.known_devices)}", flush=True)
+
+    # ── 动作（唯一的写接口）──
+    def act(self, raw_path: str) -> tuple[int, dict]:
+        """校验 token 与前台窗口，再注入一个预定义按键。"""
+        if not self.args.act_token:
+            return 403, {"ok": False, "error": "act disabled on the bridge"}
+        q = parse_qs(urlsplit(raw_path).query)
+        tok = (q.get("tok") or [""])[0]
+        # compare_digest 不接受非 ASCII 的 str；用 bytes 比较，顺带让恶意
+        # 查询串走正常的 403 而不是在 handler 里抛异常
+        if not hmac.compare_digest(tok.encode("utf-8", "replace"),
+                                   self.args.act_token.encode("utf-8")):
+            return 403, {"ok": False, "error": "bad token"}
+        name = (q.get("name") or [""])[0]
+        if name not in ACT_NAMES:
+            return 400, {"ok": False, "error": "unknown action"}
+        if os.name != "nt":
+            return 501, {"ok": False, "error": "key injection is Windows-only"}
+
+        with self.act_lock:
+            hwnd, exe, title = foreground_app()
+            if not hwnd:
+                return 409, {"ok": False, "error": "no foreground window"}
+            allow = [a.lower() for a in self.args.act_app]
+            ok = any(exe == a or (not a.endswith(".exe") and exe == a + ".exe")
+                     for a in allow)
+            if not ok:
+                print(f"  act rejected: foreground={exe or '?'} title={title[:40]!r}",
+                      flush=True)
+                return 409, {"ok": False, "error": "foreground not allowed",
+                             "app": exe, "title": title[:80]}
+            if self.args.act_dry_run:
+                print(f"  act dry-run: would send {name} to {exe} ({title[:40]!r})",
+                      flush=True)
+                return 200, {"ok": True, "dry_run": True, "action": name,
+                             "app": exe, "title": title[:80]}
+            if name == "enter":
+                focus = focus_foreground_edit(hwnd)
+                if focus != "OK":
+                    # 没聚焦就发 Enter 不只是无效：确认弹窗打开时会替用户点掉
+                    print(f"  act focus failed: {focus} (foreground={exe})", flush=True)
+                    return 422, {"ok": False, "error": "no focused input", "detail": focus}
+                vk = VK_RETURN
+            else:
+                # Esc 是窗口级按键，不需要输入框焦点（关弹窗/取消正在生成都靠它）
+                vk = VK_ESCAPE
+            if not send_key(vk):
+                print(f"  act {name} failed: SendInput returned an error "
+                      f"(foreground={exe})", flush=True)
+                return 500, {"ok": False, "error": "SendInput failed"}
+            print(f"  act {name} -> {exe} ({title[:40]!r})", flush=True)
+            return 200, {"ok": True, "action": name, "app": exe, "title": title[:80]}
 
     # ── ingress ──
     def ingest(self, payload: bytes) -> None:
@@ -352,6 +557,10 @@ def make_handler(bridge: Bridge):
                 self._send(json.dumps(status).encode(), "application/json")
             elif path == "/health":
                 self._send(b"ok", "text/plain")
+            elif path == "/act":
+                code, payload = bridge.act(self.path)
+                self._send(json.dumps(payload, ensure_ascii=False).encode(),
+                           "application/json", code)
             else:
                 self._send(b"not found", "text/plain", 404)
 
@@ -401,7 +610,21 @@ def main() -> int:
                          "so this side has to speak first. Remembered afterwards.")
     ap.add_argument("--no-push", action="store_true",
                     help="poll only; disable the instant UDP push to the device")
+    ap.add_argument("--act-token", default=None, metavar="TOKEN",
+                    help="enable the write endpoint /act with this token; it must "
+                         "match act_token in the device's config.json. Defaults to "
+                         f"the {ACT_TOKEN_FILE} file next to this script")
+    ap.add_argument("--act-app", action="append", default=None, metavar="EXE",
+                    help="foreground executable allowed to receive injected keys "
+                         "(repeatable). Default: zcode.exe")
+    ap.add_argument("--act-dry-run", action="store_true",
+                    help="authenticate and check the foreground window, but do not "
+                         "send any key (safe way to test the setup)")
     args = ap.parse_args()
+
+    if args.act_app is None:
+        args.act_app = list(DEFAULT_ACT_APPS)
+    args.act_token = load_act_token(args.act_token)
 
     # 输出重定向到文件时 Python 默认块缓冲：横幅（设备要填的地址、防火墙命令）
     # 会卡在缓冲区里，tail 日志的人看不到。整个脚本就是给人看的，改行缓冲。
@@ -471,6 +694,11 @@ def main() -> int:
     else:
         print(f"  discovery     the device finds this bridge by itself; "
               f"agent_url may be left empty")
+    if args.act_token:
+        print(f"  act           enabled for {', '.join(args.act_app)}"
+              f"{' (dry run)' if args.act_dry_run else ''}")
+    else:
+        print(f"  act           disabled (create {ACT_TOKEN_FILE} or pass --act-token)")
     print(f"  if the device cannot reach it, allow the ports once (admin cmd):")
     print(f"    netsh advfirewall firewall add rule name=\"ZCode agent bridge\" "
           f"dir=in action=allow protocol=TCP localport={args.http_port} profile=private")

@@ -15,6 +15,9 @@ struct AppConfig {
   char agent_url[96];        // Agent 状态桥接地址，形如 http://192.168.1.10:8787/agent
                              // （PC 上跑 tools/agent-bridge/bridge.py，启动时会打印
                              // 这一行，直接粘过来即可）
+  char act_token[64];        // 按键页（实验性）的写接口令牌，必须与 PC 上
+                             // tools/agent-bridge/act.token（或 --act-token）一致。
+                             // 只允许 [A-Za-z0-9_-]{8,64}，因为设备把它拼进 URL。
   bool valid;                // 至少配置了一个服务商
 };
 
@@ -85,6 +88,7 @@ inline bool loadConfig(AppConfig& cfg) {
   stripCarets(cfg.oc_cookie);
   copyTrimmed(cfg.cc_cookie,       sizeof(cfg.cc_cookie),       doc["cc_cookie"]       | "");
   copyTrimmed(cfg.agent_url,       sizeof(cfg.agent_url),       doc["agent_url"]       | "");
+  copyTrimmed(cfg.act_token,       sizeof(cfg.act_token),       doc["act_token"]       | "");
   cfg.valid = cfgOcReady(cfg) || cfgCcReady(cfg) || cfgDsReady(cfg) || cfgAgentReady(cfg);
   return true;
 }

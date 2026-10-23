@@ -22,14 +22,15 @@ static const uint16_t C_WARN  = 0xFD20;
 static const int UI_M  = 4;
 static const int UI_CW = 176;
 
-// 四行服务商 + 一行「完成」。行高 28、间距 30，正好落在 224 高的画布里。
-static const int ROW_Y0    = 44;
-static const int ROW_H     = 28;
-static const int ROW_PITCH = 30;
-static const int ROW_COUNT = 4;
-static const int DONE_SEL  = 4;
-static const int DONE_Y    = 168;
-static const int DONE_H    = 28;
+// 五行页面 + 一行「完成」。原先四行用的是行高 28/间距 30，加一行后压到
+// 24/26，最后一行的底边 170，「完成」放在 176——224 高的画布正好放下。
+static const int ROW_Y0    = 42;
+static const int ROW_H     = 24;
+static const int ROW_PITCH = 26;
+static const int ROW_COUNT = 5;
+static const int DONE_SEL  = 5;
+static const int DONE_Y    = 176;
+static const int DONE_H    = 26;
 
 static const char* PAGES_NVS_NS = "pages";
 
@@ -44,6 +45,7 @@ static const RowDef ROWS[ROW_COUNT] = {
   { "OpenCode Go",  0x1BBA, PG_OC    },  // #1976d2
   { "CommandCode",  0x044F, PG_CC    },  // #00897b
   { "DeepSeek",     0x4C7F, PG_DS    },  // #4C8DFF
+  { "按键页",       0xFFE0, PG_SEND  },  // 实验性：IO18 短按回车 / 长按 Esc
 };
 
 static bool rowConfigured(int i, const AppConfig& c) {
@@ -51,14 +53,15 @@ static bool rowConfigured(int i, const AppConfig& c) {
     case 0:  return true;          // 状态页不依赖凭据
     case 1:  return cfgOcReady(c);
     case 2:  return cfgCcReady(c);
-    default: return cfgDsReady(c);
+    case 3:  return cfgDsReady(c);
+    default: return true;          // 按键页只依赖桥接与 act_token，不算"未配置"
   }
 }
 
 uint8_t pageMaskLoad() {
   Preferences p;
-  if (!p.begin(PAGES_NVS_NS, true)) return PG_ALL;
-  uint8_t m = p.getUChar("mask", PG_ALL);
+  if (!p.begin(PAGES_NVS_NS, true)) return PG_DEFAULT;
+  uint8_t m = p.getUChar("mask", PG_DEFAULT);
   p.end();
   return m & PG_ALL;
 }
@@ -97,7 +100,7 @@ void pageSettingsDraw(const PageSettings& s, const AppConfig& cfg) {
   spr.setFont(u8g2_font_wqy12_t_gb2312b);
   spr.setTextColor(C_TEXT2);
   spr.setCursor(UI_M, 36);
-  spr.print("关闭后不再获取用量");
+  spr.print("关闭后不显示也不获取");
   char cnt[16];
   snprintf(cnt, sizeof(cnt), "%d/%d 页", onCount, ROW_COUNT);
   spr.setCursor(UI_M + UI_CW - 36, 36);
@@ -114,26 +117,30 @@ void pageSettingsDraw(const PageSettings& s, const AppConfig& cfg) {
     spr.fillCircle(UI_M + 10, y + ROW_H / 2, 3, ROWS[i].accent);
     spr.setFont(u8g2_font_wqy12_t_gb2312b);
     spr.setTextColor(on ? C_TEXT : C_TEXT2);
-    spr.setCursor(UI_M + 18, y + 19);
+    spr.setCursor(UI_M + 18, y + 16);
     spr.print(ROWS[i].label);
 
     // 没凭据的页即使打开也不会出现，先把原因写在行里，省得以为是开关坏了
     if (!rowConfigured(i, cfg)) {
       spr.setTextColor(C_WARN);
-      spr.setCursor(UI_M + UI_CW - 68, y + 19);
+      spr.setCursor(UI_M + UI_CW - 68, y + 16);
       spr.print("未配置");
+    } else if (ROWS[i].bit == PG_SEND) {
+      spr.setTextColor(C_WARN);
+      spr.setCursor(UI_M + UI_CW - 56, y + 16);
+      spr.print("实验");
     }
-    drawSwitch(UI_M + UI_CW - 30, y + 8, on, ROWS[i].accent);
+    drawSwitch(UI_M + UI_CW - 30, y + 6, on, ROWS[i].accent);
   }
 
   const bool dsel = (s.sel == DONE_SEL);
   spr.fillRoundRect(UI_M, DONE_Y, UI_CW, DONE_H, 6, dsel ? C_ACC : C_CARD);
   spr.setFont(u8g2_font_wqy12_t_gb2312b);
   spr.setTextColor(dsel ? 0x0000 : C_TEXT);
-  spr.setCursor(UI_M + 14, DONE_Y + 19);
+  spr.setCursor(UI_M + 14, DONE_Y + 17);
   spr.print("完成");
   spr.setTextColor(dsel ? 0x0000 : C_TEXT2);
-  spr.setCursor(UI_M + 58, DONE_Y + 19);
+  spr.setCursor(UI_M + 58, DONE_Y + 17);
   spr.print("保存并返回");
 
   spr.setFont(u8g2_font_wqy12_t_gb2312b);

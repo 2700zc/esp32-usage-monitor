@@ -20,6 +20,21 @@ void usageDisplayDrawOc(const OpenCodeUsage& data, const char* ip, int page, int
 void usageDisplayDrawCc(const CommandCodeUsage& data, const char* ip, int page, int pageCount,
                         const char* netStatus = nullptr);
 
+// 按键页（实验性）：显示物理键映射与最近一次动作结果。动作由 IO18 触发
+// （短按回车、长按 Esc），触摸页只做说明，避免触摸坐标在旋转后的命中问题。
+struct SendUiState {
+  bool     busy;        // 请求在途
+  int8_t   busyAction;  // 0 = 回车，1 = Esc
+  int8_t   result;      // AgActCode；-1 = 还没按过
+  int8_t   lastAction;  // 最近一次动作：0 = 回车，1 = Esc
+  uint32_t atMs;        // 结果产生时的 millis（用于「N 分钟前」）
+};
+
+// bridge 用来显示桥接连通性；按键页打开时后台仍在发现/轮询桥接。
+void usageDisplayDrawSend(const AgentStatus& bridge, const SendUiState& ui,
+                          const char* ip, int page, int pageCount,
+                          const char* netStatus = nullptr);
+
 // 一个页面都没有时的空状态。pagesOff = 页面开关全关（与"没配凭据"区分开，
 // 前者要提示怎么把开关打开）。
 void usageDisplayDrawEmpty(const char* ip, bool pagesOff);

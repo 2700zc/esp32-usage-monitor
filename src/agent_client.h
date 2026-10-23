@@ -58,3 +58,27 @@ bool agFetchHost(AgentStatus& out, const char* host, uint16_t port, const char* 
 
 // 解析一份状态 JSON（轮询与 UDP 推送共用）。pushed 只影响 out.pushed 标记。
 bool agApply(AgentStatus& out, const char* json, bool pushed);
+
+// ── 按键页（实验性）的动作接口 ──
+// 设备只发预定义动作：GET /act?name=enter&tok=…。桥接必须配置同一个 token
+// （act.token 或 --act-token），并且默认只允许前台窗口是 ZCode 时注入回车。
+enum AgActCode : uint8_t {
+  agActOk = 0,
+  agActNoToken,     // 设备 config.json 没填 act_token
+  agActNoHost,      // 还没找到桥接地址
+  agActNetwork,     // 连不上桥接（PC 关机 / IP 变了 / 防火墙）
+  agActDenied,      // 403：令牌不对，或桥接没启用 /act
+  agActForeground,  // 409：前台窗口不是允许的进程（PC 侧拒绝）
+  agActNoEdit,      // 422：前台窗口里找不到可聚焦的输入框，或聚焦失败
+  agActOldBridge,   // 404：桥接是老版本，没有 /act
+  agActFailed,      // 其它非 200
+};
+
+// 同步发送一个预定义动作（name = "enter" / "esc"）。httpStatus 输出实际状态码
+// （0 = 网络层失败）。enter 在桥接侧要先做 UIA 聚焦（约 0.5-1.5 秒），所以超时
+// 比状态轮询长；esc 不需要聚焦，但共用同一路径。
+AgActCode agSendAct(const char* name, const char* host, uint16_t port,
+                    const char* token, int& httpStatus);
+
+// 日志用的短名字（不打印 token）
+const char* agActName(AgActCode code);

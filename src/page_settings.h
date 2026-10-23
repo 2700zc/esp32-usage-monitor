@@ -10,15 +10,18 @@ enum : uint8_t {
   PG_OC    = 1u << 1,
   PG_CC    = 1u << 2,
   PG_DS    = 1u << 3,
-  PG_ALL   = 0x0F,
+  PG_SEND  = 1u << 4,   // 按键页（实验性），默认关闭
+  PG_ALL     = 0x1F,
+  // 缺省值：老设备升级后行为不变，实验性页面要手动打开才出现
+  PG_DEFAULT = PG_AGENT | PG_OC | PG_CC | PG_DS,
 };
 
-uint8_t pageMaskLoad();              // 缺省 PG_ALL（全部打开）
+uint8_t pageMaskLoad();              // 缺省 PG_DEFAULT（按键页关）
 void    pageMaskSave(uint8_t mask);  // 调用方保证值确实变了
 
 struct PageSettings {
   uint8_t mask;      // PG_* 位组合
-  int8_t  sel;       // 0..3 = 服务商，4 = 完成
+  int8_t  sel;       // 0..4 = 页面，5 = 完成
 };
 
 void pageSettingsInit(PageSettings& s, uint8_t mask);

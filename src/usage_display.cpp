@@ -23,6 +23,8 @@ static const uint16_t COL_OC      = 0x1BBA;  // #1976d2 OpenCode Go
 static const uint16_t COL_CC      = 0x044F;  // #00897b CommandCode
 static const uint16_t COL_AGENT   = 0x8AFE;  // #8B5CF6 Agent 状态页
 static const uint16_t COL_GREEN   = 0x2E6E;  // #2ECC71 思考完成
+static const uint16_t COL_SEND    = 0xFFE0;  // #FFE000 按键页的 Enter
+static const uint16_t COL_ESC     = 0xFD20;  // #FFA020 按键页的 Esc
 
 // 画布 184×224（2× 放大到物理 480×480）；边距 4 = 物理 8px，卡片几乎铺满
 static const int UI_M  = 4;
@@ -601,5 +603,80 @@ void usageDisplayDrawEmpty(const char* ip, bool pagesOff) {
   spr.setCursor(UI_M + 16, 156);
   spr.print(pagesOff ? "打开页面开关" : "再执行 uploadfs");
   drawPageDots(0, 1);
+  drawStatusBar(ip);
+}
+
+// ── 按键页（实验性）──
+
+static void drawCentered(const char* s, int y, int size, uint16_t color) {
+  spr.setFont(u8g2_font_wqy12_t_gb2312b);
+  spr.setTextSize(size);
+  spr.setTextColor(color);
+  spr.setCursor((HW_W - textWidth(s, 12, size)) / 2, y);
+  spr.print(s);
+  spr.setTextSize(1);
+}
+
+void usageDisplayDrawSend(const AgentStatus& bridge, const SendUiState& ui,
+                          const char* ip, int page, int pageCount, const char* netStatus) {
+  spr.fillScreen(COL_BG);
+
+  const char* sub;
+  uint16_t    subColor;
+  if (netStatus) {
+    sub = netStatus;                        subColor = COL_RED;
+  } else if (bridge.valid && bridge.lastError == agErrOk) {
+    sub = "桥接 · 已连接";                  subColor = COL_GREEN;
+  } else if (bridge.lastError == agErrSearching) {
+    sub = "桥接 · 正在查找";                subColor = COL_TEXT2;
+  } else if (bridge.lastError == agErrNotFound) {
+    sub = "桥接 · 没找到";                  subColor = COL_AMBER;
+  } else {
+    sub = "桥接 · 未连接";                  subColor = COL_RED;
+  }
+  drawHeader("按键", COL_SEND, sub, subColor);
+
+  // 两张说明卡：按键是物理键 IO18，触摸只负责显示。
+  drawCardBase(42);
+  drawCardValue(42, "回车", COL_SEND);
+  drawCardRow1(42, "短按 IO18", "Enter");
+
+  drawCardBase(100);
+  drawCardValue(100, "Esc", COL_ESC);
+  drawCardRow1(100, "长按 IO18 0.7 秒", "Escape");
+
+  // 最近一次结果。--result = -1 表示这次开机还没按过。
+  char line[44];
+  uint16_t color = COL_TEXT2;
+  if (ui.busy) {
+    strlcpy(line, ui.busyAction ? "正在按 Esc…" : "正在发送回车…", sizeof(line));
+    color = COL_AMBER;
+  } else if (ui.result < 0) {
+    strlcpy(line, "还没按过键", sizeof(line));
+  } else {
+    const char* text;
+    switch ((AgActCode)ui.result) {
+      case agActOk:
+        text = ui.lastAction ? "已按 Esc" : "已发送回车";
+        color = COL_GREEN; break;
+      case agActNoToken:    text = "未配置 act_token";   color = COL_AMBER; break;
+      case agActNoHost:     text = "还没找到桥接";       color = COL_AMBER; break;
+      case agActNetwork:    text = "连不上桥接";         color = COL_RED;   break;
+      case agActDenied:     text = "令牌不对/未启用";    color = COL_AMBER; break;
+      case agActForeground: text = "前台不是 ZCode";     color = COL_AMBER; break;
+      case agActNoEdit:     text = "找不到输入框";       color = COL_AMBER; break;
+      case agActOldBridge:  text = "桥接版本太旧";       color = COL_AMBER; break;
+      default:              text = "发送失败";           color = COL_RED;   break;
+    }
+    // 这一页按 10 秒兜底重绘，所以只给"分钟"粒度。
+    uint32_t sec = (millis() - ui.atMs) / 1000;
+    if (sec < 60) snprintf(line, sizeof(line), "%s", text);
+    else          snprintf(line, sizeof(line), "%s · %lu分前", text,
+                           (unsigned long)(sec / 60));
+  }
+  drawCentered(line, 172, 1, color);
+  drawCentered("物理键在任意页面生效", 190, 1, COL_TEXT2);
+
+  drawPageDots(page, pageCount);
   drawStatusBar(ip);
 }
