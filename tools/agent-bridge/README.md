@@ -246,6 +246,9 @@ curl "http://127.0.0.1:8787/act?name=enter&tok=$(cat act.token)"
 `/asr`，桥接调用火山「大模型录音文件识别」，识别结果用剪贴板 + Ctrl+V 粘贴到
 **PC 当前前台窗口**的光标处。
 
+> 完整的控制台开通步骤、标准版/极速版区别、请求字段和错误码见
+> [docs/volcengine-asr.md](../../docs/volcengine-asr.md)。
+
 ```text
 BOOT 按下 ──> ES7210 采 16 kHz / 16 bit 单声道 ──> PSRAM
 BOOT 再按 ──> POST /asr（PCM）──> bridge.py ──> 火山 ASR ──> 剪贴板 + Ctrl+V

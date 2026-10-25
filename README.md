@@ -51,11 +51,13 @@ PlatformIO + Arduino 框架，配置放在板子的文件系统里，凭据不�
   - **OpenCode Go / CommandCode**：滚动 / 每周 / 每月用量（百分比 + 距重置倒计时），
     到 100% 数字变红
   - **DeepSeek**：今日请求数、今日 Tokens（千分位）、账户余额（低于 5 元变红）
-  - **按键（实验性）**：用物理键控制 PC——IO18 **短按 = 回车**（桥接先聚焦 ZCode
-    输入框再发）、IO18 **长按 0.7 秒 = Esc**、BOOT **短按 = 右 Alt**。右 Alt 优先走
-    **蓝牙 HID**（配对后是真实键盘，豆包这类过滤注入键的程序也认），未配对时回退
-    到桥接注入。回车/Esc 需要桥接启用 `/act` 且前台是 ZCode；页面默认关闭，需在
-    设置页手动打开
+  - **按键（实验性）**：IO18 **短按 = 回车**（桥接先聚焦 ZCode 输入框再发）、
+    IO18 **长按 0.7 秒 = Esc**。回车/Esc 需要桥接启用 `/act` 且前台是 ZCode；
+    页面默认关闭，需在设置页手动打开
+- **BOOT 语音输入**：按一次开始录音，再按一次结束；音频通过 WiFi 发到 PC 桥接，
+  调用火山引擎录音文件识别，识别结果用剪贴板 + Ctrl+V 粘到当前输入框。中文、
+  中英混排都支持；云 API 密钥只存在 PC 上。详见
+  [docs/volcengine-asr.md](docs/volcengine-asr.md)
 - 用量**每 60 秒**刷新一轮；**PWR 键**随时手动刷新
 - **左右滑动**切页，到底循环，底部圆点指示当前位置
 - **屏幕随重力自动旋转**：竖放 / 横放 / 倒置时界面自动保持正立；平放在桌面上原地
@@ -209,23 +211,21 @@ pio run -e esp32-usage-monitor -t uploadfs --upload-port COM5
 [桥接 README](tools/agent-bridge/README.md#动作接口-act按键页实验性)。
 页面本身还要在设置页手动打开（默认关闭）。
 
-### 蓝牙 HID（右 Alt 通道）
+### 语音输入（BOOT）
 
-有些程序（例如豆包输入法的语音快捷键）会过滤 **软件注入** 的按键：桥接发出去的
-右 Alt 在 Windows 看来是 `LLKHF_INJECTED`，它们的低级键盘钩子会忽略；物理键盘的
-右 Alt 才有效。所以 BOOT 短按的右 Alt **优先走 BLE HID**：固件把自己枚举成一个真正的
-蓝牙键盘，发的是 HID 报文，主机侧无法区分它和物理键盘。
+BOOT 现在是语音输入键：按一次开始录音，再按一次结束。设备把 16 kHz / 16 bit
+单声道 PCM POST 到桥接的 `/asr`，桥接调用火山引擎「录音文件识别」，把文字用
+剪贴板 + Ctrl+V 粘到 PC 当前前台输入框。
 
-- 首次使用在 Windows「设置 → 蓝牙和设备 → 添加设备」里配对 **ESP32-Monitor**，
-  之后开机自动重连（配对信息存在 NVS）。按键页页头会显示「蓝牙已连/未连接」，
-  未连接时页面底部会提示配对名。
-- 未配对/未连接时，BOOT 短按回退到原来的桥接注入（对不过滤注入的程序仍然有效，
-  例如普通回车/Esc 场景；豆包不会响应）。
-- BLE 和 WiFi 共用 2.4G 射频，但右 Alt 只是偶发的一个 HID 报文，影响很小；状态页、
-  回车、Esc 仍走 WiFi 桥接。
-- 不需要 USB 数据线：USB 只负责供电/刷机，按键通道是蓝牙。
-- **收音在 PC 上**：ESP32 只发一个右 Alt 键，豆包用电脑当前默认的麦克风录音；
-  音频不经过板子、WiFi 或 BLE。板载 ES8311/ES7210 的麦克风通路本固件没有使用。
+- 密钥只在 PC 上：`tools/agent-bridge/volc.key`（一行 API Key，已 gitignore）。
+- 默认走标准版 2.0（`volc.seedasr.auc`），短句通常 1~3 秒出字；极速版用
+  `volc.bigasr.auc_turbo`，延迟更低。
+- 旧版的 BLE HID / 右 Alt 通道已经移除；BOOT 不再发右 Alt，也不再是 WiFi 配置
+  快捷入口。WiFi 配置从「双击 PWR → 设置页 → WiFi 配置」进入。
+- 设置页和 WiFi 配置页里 BOOT 仍用于确认/输入字符，否则这两个界面没法操作。
+
+完整的控制台开通、API Key、资源 ID、请求字段和错误码见
+[docs/volcengine-asr.md](docs/volcengine-asr.md)。
 
 ## ZCode 状态页完整教程
 
@@ -264,6 +264,9 @@ python tools/agent-bridge/bridge.py
 
 也可以双击 `tools/agent-bridge/start-bridge.bat`（带窗口，窗口里实时打印事件，调试用），
 或者 `bridge-daemon.bat`（无窗口，日志写 `bridge.log`）。
+
+语音输入（BOOT）还需要在 `tools/agent-bridge/volc.key` 里填火山 API Key，
+完整步骤见 [docs/volcengine-asr.md](docs/volcengine-asr.md)。
 
 启动后会打印设备需要的地址、以及需要放行的防火墙命令：
 
@@ -333,8 +336,7 @@ ZCode agent bridge up
 | 左右滑动 | 切页，到底循环 |
 | **PWR（中键）单击** | 刷新用量（先等 400ms 确认不是双击）；同时让状态页立刻重试 |
 | **PWR（中键）双击** | 进入页面开关设置页 |
-| **BOOT（右键）短按** | 按键页开启时：发右 Alt（优先蓝牙 HID，未配对时走桥接）；关闭时：进入 WiFi 配置界面 |
-| **BOOT（右键）长按** | 暂未单独绑定（松开时按短按处理）；这个槽位留给后续动作 |
+| **BOOT（右键）** | 主界面：按一下开始录音，再按一下结束；设置页 / WiFi 配置页：确认/输入 |
 | **IO18（左键）短按** | 按键页开启时：发送回车（先把光标送回 ZCode 输入框） |
 | **IO18（左键）长按 0.7 秒** | 按键页开启时：按 Esc（直接注入，不需要输入框焦点） |
 | 断电重开 | 自动连 WiFi，并从上次那台 PC 恢复状态页 |
@@ -344,8 +346,8 @@ ZCode agent bridge up
 双击 PWR 进入设置页，屏幕列出五行页面开关（状态页 / OpenCode Go / CommandCode /
 DeepSeek / 按键页）加一行「WiFi 配置」。PWR、IO18 上下选行，BOOT 切换开关；
 选到「完成」按 BOOT 保存并返回；选到「WiFi 配置」按 BOOT 进入配网，退出后回到
-设置页。「按键页」标着「实验」，默认关闭，想用时在这里打开。按键页关闭时短按
-BOOT 仍可直接进 WiFi 配置；开启后短按 BOOT 改为发送右 Alt，WiFi 配置走设置页。
+设置页。「按键页」标着「实验」，默认关闭，想用时在这里打开。BOOT 在主界面固定
+是语音输入，不再兼任 WiFi 配置快捷入口；WiFi 配置统一从设置页进入。
 
 - 关掉的页面从滑动序列里消失，页码圆点自动减去一页。
 - 关掉同时**停止抓取**：该服务商不再进入 60 秒轮次，过期的 token / cookie 不会
@@ -382,8 +384,8 @@ FreeRTOS 任务**里，UI 循环只做触摸采样和绘制，从不等待网络
 
 - **第一次到一个全新的地方**：桥接那边还没有任何设备记忆，也就不知道该喊谁。用
   `python tools/agent-bridge/bridge.py --announce-to <板子IP>` 引导一次，之后它就记住了。
-- **板子的 WiFi 也换了**（换了路由器/换了网段）：那要在板子上重配 WiFi——按 **BOOT** 键
-  进配置界面，扫描选网络、输密码。这跟桥接是两件独立的事。
+- **板子的 WiFi 也换了**（换了路由器/换了网段）：那要在板子上重配 WiFi——**双击 PWR**
+  进设置页，选「WiFi 配置」，扫描选网络、输密码。这跟桥接是两件独立的事。
 
 同一个局域网里两台电脑都跑桥接也可以，设备只会认它当前连上的那台。
 
@@ -427,10 +429,13 @@ FreeRTOS 任务**里，UI 循环只做触摸采样和绘制，从不等待网络
 │   ├── usage_display.cpp/h  # 五个页面（含实验性按键页）的绘制
 │   ├── page_settings.cpp/h  # 设备上的页面开关（NVS 持久化 + 设置页）
 │   ├── wifi_config.cpp/h    # WiFi 配置界面（扫描 + 软键盘）
+│   ├── voice_input.cpp/h    # BOOT 录音 / ES7210 采集 / 上传 / 语音状态界面
 │   ├── config.h             # 配置结构体 + 加载
-│   └── hw/                  # 硬件层：显示 / 输入 / 手势 / 自动旋转 / 电源 / IMU / RTC / 扩展器
+│   └── hw/                  # 硬件层：显示 / 输入 / 手势 / 旋转 / 电源 / IMU / RTC / 扩展器 / ES7210
+├── docs/
+│   └── volcengine-asr.md    # 火山引擎录音文件识别接入教程
 ├── tools/
-│   └── agent-bridge/        # PC 侧：Agent 状态桥接（详见其中的 README）
+│   └── agent-bridge/        # PC 侧：Agent 状态桥接 + /asr 语音识别（详见其中的 README）
 └── platformio.ini           # PlatformIO 配置
 ```
 
@@ -455,7 +460,7 @@ pio device monitor -p COM5 -b 115200                # 串口日志
 - **`data/config.json` 含凭据，已在 `.gitignore` 里**，不会被提交。仓库里只有
   `data/config.json.example`（占位符）。
 - 桥接的运行产物也不会被提交：`tools/agent-bridge/*.log`、`devices.json`（设备 IP）、
-  `__pycache__/`。
+  `act.token`、`volc.key`、`__pycache__/`。
 - **给设备的是网页登录态凭据**（DeepSeek token、CommandCode/OpenCode 会话 cookie），
   它们存在板子的文件系统里。设备丢了就等于这些凭据落在别人手里 —— 请把它们当成
   "一次性、可随时吊销"的东西，丢了就去各家后台重新登录（旧凭据自然失效）。
