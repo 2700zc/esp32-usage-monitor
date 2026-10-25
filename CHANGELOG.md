@@ -2,6 +2,20 @@
 
 ## 2026-10-25
 
+### BOOT 语音输入（Volcengine 标准版 2.0）
+
+- BOOT 短按开始录音、再短按结束；ES7210 采 16 kHz / 16 bit 单声道，PSRAM
+  缓存，WiFi POST 到桥接的 `/asr`。一次最长 60 秒。
+- 桥接按资源 ID 自动选择接口：标准版 2.0（`volc.seedasr.auc`，提交 + 查询，
+  短句通常 1~3 秒）或极速版（`volc.bigasr.auc_turbo`，同步 flash）。识别结果
+  用剪贴板 + Ctrl+V 注入 PC 当前前台输入框，中文 / 中英混排可用。
+- API Key 只存在 PC 的 `tools/agent-bridge/volc.key`（已 gitignore），固件和
+  `data/config.json` 里没有云 API 密钥。
+- 旧的 BLE HID / 右 Alt 通道移除；BOOT 不再发右 Alt，也不再是 WiFi 配置
+  快捷入口。WiFi 配置统一从「双击 PWR → 设置页 → WiFi 配置」进入。
+- WiFi 扫描页底部提示修正为 `PWR↓ IO18↑ BOOT:OK`。
+- 完整接入教程见 `docs/volcengine-asr.md`；按键表见 README 的「按键功能」。
+
 ### BOOT 长按清空刚才的语音输入
 
 - 主界面长按 BOOT 0.9 秒 → 设备发 `GET /clear?tok=…`，桥接把最近一次 `/asr`
