@@ -1,0 +1,15 @@
+.pio/
+.vscode/
+.zcode/
+dist/
+*.bin
+*.elf
+*.map
+compile_commands.json
+data/config.json
+config.json.bak*
+__pycache__/
+tools/agent-bridge/*.log
+tools/agent-bridge/devices.json
+tools/agent-bridge/act.token
+tools/agent-bridge/volc.key
