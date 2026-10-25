@@ -116,6 +116,13 @@ GMEM_MOVEABLE = 0x0002
 GMEM_ZEROINIT = 0x0040
 VK_CONTROL = 0x11
 VK_V = 0x56
+VK_BACK = 0x08
+# 长按 BOOT 清空只对"刚刚"粘贴的文字生效：光标可能已经被用户挪走，太久
+# 之后再回删会删到别的内容。2 分钟足够看完一句话再决定重说。
+CLEAR_TTL_SEC = 120
+# 单次最多回删这么多字符：设备一次录音上限 60 秒，正常转录远小于此值；
+# 设上限只是防止异常数据让桥接连发几万次按键。
+CLEAR_MAX_CHARS = 1000
 
 
 def load_act_token(cli_value: str | None) -> str:
@@ -533,33 +540,46 @@ def volc_transcribe(wav_bytes: bytes, args: argparse.Namespace) -> str:
     return volc_transcribe_flash(wav_bytes, args)
 
 
-def paste_text(text: str, args: argparse.Namespace) -> tuple[bool, str, str]:
-    """把文字粘贴到当前前台窗口。返回 (ok, exe, 说明)。"""
+def send_backspaces(count: int) -> bool:
+    """向当前前台窗口连发 count 次 Backspace。
+
+    逐次注入而不是拼成一批：目标程序每收到一个字符都会更新光标/行高，
+    留 8ms 让它处理完再发下一个，长文本时比一次性塞进去更稳。
+    """
+    for _ in range(count):
+        if not send_key(VK_BACK):
+            return False
+        time.sleep(0.008)
+    return True
+
+
+def paste_text(text: str, args: argparse.Namespace) -> tuple[bool, str, str, int]:
+    """把文字粘贴到当前前台窗口。返回 (ok, exe, 说明, hwnd)。"""
     if os.name != "nt":
-        return False, "", "paste is Windows-only"
+        return False, "", "paste is Windows-only", 0
     hwnd, exe, title = foreground_app()
     if not hwnd:
-        return False, exe, "no foreground window"
+        return False, exe, "no foreground window", 0
     if args.asr_app:
         allow = [a.lower() for a in args.asr_app]
         ok = any(exe == a or (not a.endswith(".exe") and exe == a + ".exe")
                  for a in allow)
         if not ok:
-            return False, exe, f"foreground {exe or '?'} not in --asr-app"
+            return False, exe, f"foreground {exe or '?'} not in --asr-app", int(hwnd)
 
     prev = clipboard_get_text() if args.restore_clipboard else None
     if not clipboard_set_text(text):
-        return False, exe, "clipboard write failed"
+        return False, exe, "clipboard write failed", int(hwnd)
     time.sleep(0.05)
     if not send_ctrl_v():
-        return False, exe, "SendInput Ctrl+V failed"
+        return False, exe, "SendInput Ctrl+V failed", int(hwnd)
 
     if args.restore_clipboard and prev is not None:
         def restore() -> None:
             time.sleep(0.6)
             clipboard_set_text(prev)
         threading.Thread(target=restore, daemon=True).start()
-    return True, exe, title
+    return True, exe, title, int(hwnd)
 
 
 def load_devices(path) -> list[str]:
@@ -588,6 +608,9 @@ class Bridge:
         self.device_seen = 0.0
         self.last_push_seq = -1
         self.act_lock = threading.Lock()   # 两次按键注入不能交错
+        # 最近一次成功粘贴：清空接口要知道删多少字符、删在哪个窗口。只在
+        # act_lock 内读写；桥接重启后为空，此时长按 BOOT 会提示没有可清空的内容。
+        self.last_paste: dict | None = None
         self.udp_out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.state_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), STATE_FILE)
         self.known_devices = load_devices(self.state_path)
@@ -706,12 +729,68 @@ class Bridge:
             return 200, {"ok": True, "text": text, "dry_run": True}
 
         with self.act_lock:
-            ok, exe, title = paste_text(text, self.args)
+            ok, exe, title, hwnd = paste_text(text, self.args)
+            if ok:
+                self.last_paste = {
+                    "chars": len(text),
+                    "hwnd": hwnd,
+                    "exe": exe,
+                    "title": title,
+                    "at": time.time(),
+                }
         if not ok:
             print(f"  asr paste failed: {title}", flush=True)
             return 409, {"ok": False, "error": title, "text": text}
         print(f"  asr: {len(text)} chars -> {exe} ({title[:40]!r})", flush=True)
         return 200, {"ok": True, "text": text, "app": exe}
+
+    # ── 清空最近一次粘贴 ──
+    def clear_last(self, raw_path: str) -> tuple[int, dict]:
+        """把最近一次语音粘贴的文字删掉（按字符数逐字发 Backspace）。
+
+        只在"同一个前台窗口"里生效：用户如果已经切走，回删就落到别的程序
+        里了，所以宁可拒绝。清空成功后忘掉这次粘贴，再长按不会继续删更早
+        的文字。
+        """
+        if not self.args.act_token:
+            return 403, {"ok": False, "error": "clear disabled: no act_token"}
+        q = parse_qs(urlsplit(raw_path).query)
+        tok = (q.get("tok") or [""])[0]
+        if not hmac.compare_digest(tok.encode("utf-8", "replace"),
+                                   self.args.act_token.encode("utf-8")):
+            return 403, {"ok": False, "error": "bad token"}
+        if os.name != "nt":
+            return 501, {"ok": False, "error": "key injection is Windows-only"}
+
+        with self.act_lock:
+            lp = self.last_paste
+            if not lp:
+                return 409, {"ok": False, "error": "没有可清空的输入"}
+            if time.time() - lp["at"] > CLEAR_TTL_SEC:
+                self.last_paste = None
+                return 409, {"ok": False,
+                             "error": f"上次输入已超过 {CLEAR_TTL_SEC // 60} 分钟，无法清空"}
+            hwnd, exe, title = foreground_app()
+            if not hwnd:
+                return 409, {"ok": False, "error": "没有前台窗口"}
+            if int(hwnd) != lp["hwnd"]:
+                return 409, {"ok": False,
+                             "error": "前台窗口已切换，请切回刚才的窗口"}
+            n = int(lp["chars"])
+            if n <= 0 or n > CLEAR_MAX_CHARS:
+                return 409, {"ok": False, "error": "上次输入长度异常，无法清空"}
+
+            if self.args.asr_dry_run:
+                print(f"  clear dry-run: would delete {n} chars "
+                      f"from {exe} ({title[:40]!r})", flush=True)
+                return 200, {"ok": True, "chars": n, "dry_run": True}
+            if not send_backspaces(n):
+                print(f"  clear failed: SendInput returned an error "
+                      f"(foreground={exe})", flush=True)
+                return 500, {"ok": False, "error": "SendInput failed"}
+            self.last_paste = None
+            print(f"  clear: {n} chars <- {exe} ({title[:40]!r})", flush=True)
+            return 200, {"ok": True, "chars": n, "app": exe, "title": title[:80]}
 
     # ── ingress ──
     def ingest(self, payload: bytes) -> None:
@@ -974,6 +1053,10 @@ def make_handler(bridge: Bridge):
                 self._send(b"ok", "text/plain")
             elif path == "/act":
                 code, payload = bridge.act(self.path)
+                self._send(json.dumps(payload, ensure_ascii=False).encode(),
+                           "application/json", code)
+            elif path == "/clear":
+                code, payload = bridge.clear_last(self.path)
                 self._send(json.dumps(payload, ensure_ascii=False).encode(),
                            "application/json", code)
             else:

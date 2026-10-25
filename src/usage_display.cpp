@@ -689,7 +689,7 @@ void usageDisplayDrawSend(const AgentStatus& bridge, const SendUiState& ui,
   }
   drawCentered(line, 154, 1, color);
   drawCentered("IO18 在任意页面生效", 172, 1, COL_TEXT2);
-  drawCentered("BOOT 在任意页面开始语音", 189, 1, COL_TEXT2);
+  drawCentered("BOOT 短按语音 · 长按清空", 189, 1, COL_TEXT2);
 
   drawPageDots(page, pageCount);
   drawStatusBar(ip);

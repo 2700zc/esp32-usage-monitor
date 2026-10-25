@@ -1,4 +1,5 @@
 #include "voice_input.h"
+#include "agent_client.h"
 
 #include "hw/display.h"
 #include "hw/input.h"
@@ -27,6 +28,9 @@ static const uint32_t VOICE_FRAME_MS     = 20;
 static const uint32_t VOICE_FRAME_SAMPLES = VOICE_SAMPLE_RATE * VOICE_FRAME_MS / 1000;
 static const i2s_port_t VOICE_I2S_PORT   = I2S_NUM_1;
 static const uint32_t VOICE_RESULT_MS    = 1800;   // 结果提示停留时间
+// 长按 BOOT 清空：短按是说话（松开才结算，避免长按误开录音），按住这么久
+// 才算清空。1 秒是刻意的大于普通点按时长，又不会让人等得不耐烦。
+static const uint32_t VOICE_CLEAR_HOLD_MS = 900;
 
 // ── 配色：与 usage_display 同一套 ──
 static const uint16_t C_BG     = 0x0000;
@@ -38,7 +42,12 @@ static const uint16_t C_AMBER  = 0xFD20;
 static const uint16_t C_RED    = 0xF800;
 static const uint16_t C_OFF    = 0x2104;
 
-enum class VState : uint8_t { Idle, Recording, Uploading, Done, Error };
+enum class VState : uint8_t {
+  Idle, Recording, Uploading, Done, Error,
+  Clearing,       // 正在请求桥接回删
+  Cleared,        // 回删成功（显示删除字数）
+  ClearFailed,    // 回删失败（显示桥接给的原因）
+};
 
 static volatile VState s_state = VState::Idle;
 static volatile bool   s_stopReq = false;
@@ -63,8 +72,14 @@ static char s_upToken[64] = "";
 
 static char s_text[192] = "";
 static char s_err[96] = "";
+static int  s_clearedChars = 0;   // Cleared 界面显示的字数
 static portMUX_TYPE s_textMux = portMUX_INITIALIZER_UNLOCKED;
 static bool s_initOk = false;
+
+// BOOT 的短按/长按结算。按下时不立刻动作，松开时若没到长按阈值才算短按；
+// 录音中按下的那一下仍然立即停止录音（见 voiceInputHandleButton）。
+static bool s_bootTracking = false;
+static bool s_bootLongDone = false;
 
 // ── 小工具 ──
 
@@ -418,20 +433,90 @@ static void voiceToggle() {
   Serial.printf("voice: recording -> %s:%u\n", s_upHost, (unsigned)s_upPort);
 }
 
+static void voiceClearLast() {
+  // 请求期间主循环会被占住（最坏 6 秒），所以先把"正在清空"画出来并推屏。
+  strlcpy(s_upHost, s_host, sizeof(s_upHost));
+  s_upPort = s_port;
+  strlcpy(s_upToken, s_token, sizeof(s_upToken));
+
+  s_clearedChars = 0;
+  s_err[0] = 0;
+  s_level = 0;
+  s_endedMs = 0;
+  s_state = VState::Clearing;
+  voiceInputDraw();
+  hwDisplayPush();
+
+  int st = 0, chars = 0;
+  char err[96] = "";
+  const bool ok = agSendClear(s_upHost, s_upPort, s_upToken,
+                              st, chars, err, sizeof(err));
+  s_clearedChars = chars;
+  if (ok) {
+    s_state = VState::Cleared;
+  } else {
+    strlcpy(s_err, err[0] ? err : "清空失败", sizeof(s_err));
+    s_state = VState::ClearFailed;
+  }
+  s_endedMs = millis();
+  s_redraw = true;
+  Serial.printf("voice: clear %s (http=%d, chars=%d%s%s)\n",
+                ok ? "ok" : "failed", st, chars,
+                ok ? "" : ", ", ok ? "" : s_err);
+}
+
 void voiceInputHandleButton(bool allowToggle) {
-  if (!allowToggle) return;
-  if (!hwBtnBoot().wasPressed) return;
-  voiceToggle();
+  // 设置页 / WiFi 配置页里 BOOT 归那些页面；进入前如果在按着，退出后也
+  // 不能补发一次语音。
+  if (!allowToggle) {
+    s_bootTracking = false;
+    s_bootLongDone = false;
+    return;
+  }
+
+  const HwBtn& boot = hwBtnBoot();
+
+  if (boot.wasPressed) {
+    if (s_state == VState::Recording) {
+      s_stopReq = true;               // 录音中按下立即停，和以前一样
+      s_bootTracking = false;
+      Serial.println("voice: stop requested");
+      return;
+    }
+    if (s_state == VState::Uploading || s_state == VState::Clearing) {
+      s_bootTracking = false;         // 识别 / 清空期间忽略按键
+      return;
+    }
+    // Idle / Done / Error / Cleared / ClearFailed：
+    // 先不动作，等松开（短按）或按满阈值（长按清空）再结算。
+    s_bootTracking = true;
+    s_bootLongDone = false;
+  }
+
+  if (s_bootTracking && !s_bootLongDone &&
+      boot.pressedFor(VOICE_CLEAR_HOLD_MS)) {
+    s_bootLongDone = true;
+    voiceClearLast();                 // 长按 = 清空刚才粘贴到电脑的文字
+  }
+
+  if (boot.wasReleased) {
+    if (s_bootTracking && !s_bootLongDone) voiceToggle();
+    s_bootTracking = false;
+    s_bootLongDone = false;
+  }
 }
 
 void voiceInputTick() {
-  // 串口输入 v 等价于按一次 BOOT。这是给调试/自动化用的后备入口：不接
-  // 物理按键时也能验证采集和上传链路；正常使用不依赖它。
+  // 串口输入 v / c 分别等价于短按 / 长按 BOOT。这是给调试/自动化用的后备
+  // 入口：不接物理按键时也能验证录音、上传和清空链路；正常使用不依赖它。
   if (Serial.available() > 0) {
     int c = Serial.read();
     if (c == 'v' || c == 'V') {
       Serial.println("voice: serial toggle");
       voiceToggle();
+    } else if (c == 'c' || c == 'C') {
+      Serial.println("voice: serial clear");
+      voiceClearLast();
     }
   }
   if (s_state == VState::Recording && !s_stopReq &&
@@ -439,7 +524,8 @@ void voiceInputTick() {
     s_stopReq = true;
     Serial.println("voice: max duration, auto stop");
   }
-  if ((s_state == VState::Done || s_state == VState::Error) &&
+  if ((s_state == VState::Done || s_state == VState::Error ||
+       s_state == VState::Cleared || s_state == VState::ClearFailed) &&
       s_endedMs != 0 && millis() - s_endedMs >= VOICE_RESULT_MS) {
     s_state = VState::Idle;
     s_endedMs = 0;
@@ -509,13 +595,32 @@ void voiceInputDraw() {
     case VState::Done: {
       drawCentered("已输入到电脑", 62, 16, 1, C_GREEN);
       drawWrapped(text, 10, 88, 164, 17, 5, C_TEXT);
-      drawCentered("按 BOOT 再说一句", 190, 12, 1, C_TEXT2);
+      drawCentered("短按说话 · 长按清空", 190, 12, 1, C_TEXT2);
       break;
     }
     case VState::Error: {
       drawCentered("没有成功", 62, 16, 1, C_RED);
       drawWrapped(s_err, 10, 90, 164, 17, 3, C_TEXT);
-      drawCentered("按 BOOT 重试", 190, 12, 1, C_TEXT2);
+      drawCentered("短按重试 · 长按清空", 190, 12, 1, C_TEXT2);
+      break;
+    }
+    case VState::Clearing: {
+      drawCentered("正在清空", 96, 16, 1, C_AMBER);
+      drawCentered("请稍候…", 124, 12, 1, C_TEXT2);
+      break;
+    }
+    case VState::Cleared: {
+      drawCentered("已清空", 62, 16, 1, C_GREEN);
+      char msg[48];
+      snprintf(msg, sizeof(msg), "已删除 %d 个字符", s_clearedChars);
+      drawCentered(msg, 96, 12, 1, C_TEXT);
+      drawCentered("短按说话 · 长按清空", 190, 12, 1, C_TEXT2);
+      break;
+    }
+    case VState::ClearFailed: {
+      drawCentered("清空失败", 62, 16, 1, C_RED);
+      drawWrapped(s_err, 10, 90, 164, 17, 3, C_TEXT);
+      drawCentered("长按重试 · 短按说话", 190, 12, 1, C_TEXT2);
       break;
     }
     default:

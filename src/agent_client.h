@@ -81,5 +81,11 @@ enum AgActCode : uint8_t {
 AgActCode agSendAct(const char* name, const char* host, uint16_t port,
                     const char* token, int& httpStatus);
 
+// 清空最近一次语音粘贴到 PC 的文字（GET /clear?tok=…）。桥接按上次粘贴的
+// 字符数逐字回删，并且要求前台窗口与粘贴时相同、距粘贴不超过 2 分钟。
+// chars 输出实际删除的字符数；失败时 err 里是可直接上屏的中文原因。
+bool agSendClear(const char* host, uint16_t port, const char* token,
+                 int& httpStatus, int& chars, char* err, size_t errSz);
+
 // 日志用的短名字（不打印 token）
 const char* agActName(AgActCode code);

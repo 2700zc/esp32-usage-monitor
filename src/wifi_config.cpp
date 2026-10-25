@@ -118,7 +118,7 @@ static void drawScanList(WfConfig& cfg) {
     spr.setFont(u8g2_font_wqy12_t_gb2312b);
     spr.setTextColor(C_DIM);
     spr.setCursor(SAFE_L, SAFE_B - 14);
-    spr.print("PWR:\xe2\x86\x95 BOOT:\xe2\x86\xb5");
+    spr.print("PWR:\xe2\x86\x93 IO18:\xe2\x86\x91 BOOT:OK");
 }
 
 static void drawKeyboard(WfConfig& cfg) {

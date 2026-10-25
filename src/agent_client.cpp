@@ -163,6 +163,52 @@ AgActCode agSendAct(const char* name, const char* host, uint16_t port,
   }
 }
 
+// ── 清空最近一次语音粘贴 ──
+// 桥接只在"同一个前台窗口 + 距粘贴 2 分钟内"才回删，所以这里不需要再判断
+// 前台程序；把桥接返回的错误原样带到屏幕上，用户能直接看懂原因。
+bool agSendClear(const char* host, uint16_t port, const char* token,
+                 int& httpStatus, int& chars, char* err, size_t errSz) {
+  httpStatus = 0;
+  chars = 0;
+  if (err && errSz) err[0] = 0;
+
+  if (!token || !token[0]) {
+    if (err && errSz) snprintf(err, errSz, "未配置 act_token");
+    return false;
+  }
+  if (!host || !host[0]) {
+    if (err && errSz) snprintf(err, errSz, "还没找到电脑桥接");
+    return false;
+  }
+
+  char path[128];
+  snprintf(path, sizeof(path), "/clear?tok=%s", token);
+
+  String body;
+  int st = httpGetPlain("clear", host, port, path, nullptr, 0, body, 6000);
+  httpStatus = st;
+  if (st <= 0) {
+    if (err && errSz) snprintf(err, errSz, "连不上电脑桥接");
+    return false;
+  }
+
+  JsonDocument doc;
+  DeserializationError je = deserializeJson(doc, body);
+  if (!je) {
+    chars = doc["chars"] | 0;
+    if (st == 200 && (doc["ok"] | false)) return true;
+    const char* e = doc["error"] | "";
+    if (err && errSz) {
+      if (e[0]) snprintf(err, errSz, "%s", e);
+      else      snprintf(err, errSz, "清空失败 (HTTP %d)", st);
+    }
+    return false;
+  }
+
+  if (err && errSz) snprintf(err, errSz, "电脑返回异常 (HTTP %d)", st);
+  return false;
+}
+
 const char* agActName(AgActCode code) {
   switch (code) {
     case agActOk:         return "ok";
