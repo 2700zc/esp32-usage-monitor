@@ -11,3 +11,4 @@ __pycache__/
 tools/agent-bridge/*.log
 tools/agent-bridge/devices.json
 tools/agent-bridge/act.token
+tools/agent-bridge/volc.key

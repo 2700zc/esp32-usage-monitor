@@ -16,8 +16,10 @@ install (the packaged Python 3.14 that ships with the dev box is fine).
 from __future__ import annotations
 
 import argparse
+import base64
 import ctypes
 import hmac
+import io
 import json
 import os
 import re
@@ -26,6 +28,10 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
+import uuid
+import wave
 from ctypes import wintypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
@@ -91,6 +97,33 @@ KEYEVENTF_KEYUP = 0x0002
 INPUT_KEYBOARD = 1
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
+# ── 语音输入（设备 -> 火山 ASR -> 剪贴板粘贴）──────────────────────────
+# 设备把 16 kHz / 16 bit 单声道 PCM 直接放进 POST body，桥接补 WAV 头后
+# 交给火山「大模型录音文件识别」。识别结果用剪贴板 + Ctrl+V 注入当前前台
+# 窗口：SendInput 的普通按键事件打不出中文，而剪贴板对任意输入框都有效。
+VOLC_FLASH_URL = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash"
+VOLC_SUBMIT_URL = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/submit"
+VOLC_QUERY_URL = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/query"
+# 标准版（异步提交 + 查询）：2.0 用 volc.seedasr.auc，1.0 用 volc.bigasr.auc。
+# 极速版（同步 flash）用 volc.bigasr.auc_turbo。默认走标准版 2.0，因为
+# 大多数新账号只开通了标准版。
+VOLC_RESOURCE_DEFAULT = "volc.seedasr.auc"
+VOLC_STANDARD_RESOURCES = ("volc.seedasr.auc", "volc.bigasr.auc")
+VOLC_KEY_FILE = "volc.key"
+ASR_MAX_BYTES = 8 * 1024 * 1024
+CF_UNICODETEXT = 13
+GMEM_MOVEABLE = 0x0002
+GMEM_ZEROINIT = 0x0040
+VK_CONTROL = 0x11
+VK_V = 0x56
+VK_BACK = 0x08
+# 长按 BOOT 清空只对"刚刚"粘贴的文字生效：光标可能已经被用户挪走，太久
+# 之后再回删会删到别的内容。2 分钟足够看完一句话再决定重说。
+CLEAR_TTL_SEC = 120
+# 单次最多回删这么多字符：设备一次录音上限 60 秒，正常转录远小于此值；
+# 设上限只是防止异常数据让桥接连发几万次按键。
+CLEAR_MAX_CHARS = 1000
+
 
 def load_act_token(cli_value: str | None) -> str:
     """CLI 优先，其次读脚本旁边的 act.token。非法值当作没配置。"""
@@ -110,6 +143,25 @@ def load_act_token(cli_value: str | None) -> str:
               file=sys.stderr, flush=True)
         return ""
     return tok
+
+
+class VolcError(RuntimeError):
+    pass
+
+
+def load_volc_key(cli_value: str | None) -> str:
+    """CLI 优先，其次环境变量 VOLC_API_KEY，最后读脚本旁边的 volc.key。"""
+    if cli_value:
+        return cli_value.strip()
+    env = os.environ.get("VOLC_API_KEY", "").strip()
+    if env:
+        return env
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), VOLC_KEY_FILE)
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.readline().strip()
+    except OSError:
+        return ""
 
 
 class _KEYBDINPUT(ctypes.Structure):
@@ -258,6 +310,278 @@ def warm_uia() -> None:
         pass
 
 
+# ── 剪贴板 + Ctrl+V ──────────────────────────────────────────────────────
+# 中文没法用 SendInput 的普通按键事件打出来（那只能发虚拟键码），所以识别
+# 结果先放进剪贴板，再向前台窗口发一次 Ctrl+V。粘贴完把用户原来的剪贴板
+# 内容放回去（默认开启；--no-restore-clipboard 可关）。
+def _clipboard_api():
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalAlloc.argtypes = (wintypes.UINT, ctypes.c_size_t)
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = (ctypes.c_void_p,)
+    kernel32.GlobalUnlock.argtypes = (ctypes.c_void_p,)
+    kernel32.GlobalFree.argtypes = (ctypes.c_void_p,)
+    user32.OpenClipboard.argtypes = (ctypes.c_void_p,)
+    user32.SetClipboardData.argtypes = (wintypes.UINT, ctypes.c_void_p)
+    user32.SetClipboardData.restype = ctypes.c_void_p
+    user32.GetClipboardData.argtypes = (wintypes.UINT,)
+    user32.GetClipboardData.restype = ctypes.c_void_p
+    return user32, kernel32
+
+
+def clipboard_get_text() -> str | None:
+    if os.name != "nt":
+        return None
+    user32, kernel32 = _clipboard_api()
+    for _ in range(5):
+        if user32.OpenClipboard(None):
+            break
+        time.sleep(0.02)
+    else:
+        return None
+    try:
+        h = user32.GetClipboardData(CF_UNICODETEXT)
+        if not h:
+            return None
+        p = kernel32.GlobalLock(ctypes.c_void_p(h))
+        if not p:
+            return None
+        try:
+            return ctypes.wstring_at(p)
+        finally:
+            kernel32.GlobalUnlock(ctypes.c_void_p(h))
+    finally:
+        user32.CloseClipboard()
+
+
+def clipboard_set_text(text: str) -> bool:
+    if os.name != "nt":
+        return False
+    user32, kernel32 = _clipboard_api()
+    for _ in range(5):
+        if user32.OpenClipboard(None):
+            break
+        time.sleep(0.02)
+    else:
+        return False
+    try:
+        user32.EmptyClipboard()
+        data = text.encode("utf-16-le") + b"\x00\x00"
+        h = kernel32.GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, len(data))
+        if not h:
+            return False
+        p = kernel32.GlobalLock(ctypes.c_void_p(h))
+        if not p:
+            kernel32.GlobalFree(ctypes.c_void_p(h))
+            return False
+        ctypes.memmove(p, data, len(data))
+        kernel32.GlobalUnlock(ctypes.c_void_p(h))
+        # SetClipboardData 成功后句柄归系统所有，不能再 GlobalFree。
+        if not user32.SetClipboardData(CF_UNICODETEXT, ctypes.c_void_p(h)):
+            kernel32.GlobalFree(ctypes.c_void_p(h))
+            return False
+        return True
+    finally:
+        user32.CloseClipboard()
+
+
+def send_ctrl_v() -> bool:
+    """向前台窗口发 Ctrl+V；按下/抬起之间留一点时间，避开输入法钩子。"""
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int)
+    user32.SendInput.restype = wintypes.UINT
+
+    def event(vk: int, up: bool) -> _INPUT:
+        inp = _INPUT()
+        inp.type = INPUT_KEYBOARD
+        inp.ki.wVk = vk
+        inp.ki.dwFlags = KEYEVENTF_KEYUP if up else 0
+        return inp
+
+    seq = ((VK_CONTROL, False), (VK_V, False), (VK_V, True), (VK_CONTROL, True))
+    for i, (vk, up) in enumerate(seq):
+        inp = event(vk, up)
+        if user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT)) != 1:
+            return False
+        if i == 1:
+            time.sleep(0.03)
+        else:
+            time.sleep(0.01)
+    return True
+
+
+# ── 火山「大模型录音文件识别」flash 接口 ─────────────────────────────────
+def _volc_auth_headers(args: argparse.Namespace, request_id: str) -> dict:
+    # CLI/环境变量优先；否则每次请求都读一次 volc.key，这样填完密钥
+    # 不用重启桥接就能生效。
+    api_key = args.volc_api_key or load_volc_key(None)
+    if not api_key and not (args.volc_app_key and args.volc_access_key):
+        raise VolcError(f"没有配置火山 API Key：创建 {VOLC_KEY_FILE} 或设置 VOLC_API_KEY")
+    headers = {
+        "Content-Type": "application/json",
+        "X-Api-Resource-Id": args.volc_resource_id,
+        "X-Api-Request-Id": request_id,
+        "X-Api-Sequence": "-1",
+    }
+    if api_key:
+        headers["X-Api-Key"] = api_key
+    else:
+        headers["X-Api-App-Key"] = args.volc_app_key
+        headers["X-Api-Access-Key"] = args.volc_access_key
+    return headers
+
+
+def _volc_post(url: str, headers: dict, payload: dict):
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"),
+        headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            return resp.status, resp.headers, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers, e.read()
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise VolcError(f"连不上火山 ASR: {e}") from e
+
+
+def _volc_resource_hint(resource_id: str) -> str:
+    if resource_id in VOLC_STANDARD_RESOURCES:
+        return "火山未授权 45000030：请开通录音文件识别标准版 2.0"
+    return "火山未授权 45000030：请开通录音文件识别极速版"
+
+
+def _volc_check(http_code: int, headers, body: bytes, resource_id: str) -> None:
+    status = headers.get("X-Api-Status-Code", "") if headers else ""
+    if http_code == 200 and status == "20000000":
+        return
+    detail = body.decode("utf-8", "replace")[:300]
+    # 原始 body 写日志：里面的 reqid / logid 找火山支持时要提供。
+    print(f"  asr: volc raw http={http_code} api={status} {detail[:240]}", flush=True)
+    if status == "45000030":
+        raise VolcError(_volc_resource_hint(resource_id))
+    raise VolcError(f"火山识别失败 http={http_code} api={status}: {detail}")
+
+
+def volc_transcribe_flash(wav_bytes: bytes, args: argparse.Namespace) -> str:
+    """极速版：一次请求直接返回结果。"""
+    request_id = str(uuid.uuid4())
+    headers = _volc_auth_headers(args, request_id)
+    payload = {
+        "user": {"uid": args.volc_app_key or "esp32-voice"},
+        "audio": {
+            "data": base64.b64encode(wav_bytes).decode("ascii"),
+            "format": "wav",
+            "language": args.volc_language,
+        },
+        "request": {
+            "model_name": "bigmodel",
+            "enable_itn": True,
+            "enable_punc": True,
+            "show_utterances": False,
+        },
+    }
+    http_code, resp_headers, body = _volc_post(VOLC_FLASH_URL, headers, payload)
+    _volc_check(http_code, resp_headers, body, args.volc_resource_id)
+    try:
+        data = json.loads(body or b"{}")
+    except Exception as e:
+        raise VolcError(f"火山返回不是 JSON: {body[:200]!r}") from e
+    return str((data.get("result") or {}).get("text") or "").strip()
+
+
+def volc_transcribe_standard(wav_bytes: bytes, args: argparse.Namespace) -> str:
+    """标准版：提交任务后轮询查询。短音频通常 1~3 秒出结果。"""
+    task_id = str(uuid.uuid4())
+    headers = _volc_auth_headers(args, task_id)
+    payload = {
+        "audio": {
+            "data": base64.b64encode(wav_bytes).decode("ascii"),
+            "format": "wav",
+            "codec": "raw",
+            "rate": 16000,
+            "bits": 16,
+            "channel": 1,
+        },
+        "request": {
+            "model_name": "bigmodel",
+            "enable_itn": True,
+            "enable_punc": True,
+            "show_utterances": False,
+        },
+    }
+    http_code, resp_headers, body = _volc_post(VOLC_SUBMIT_URL, headers, payload)
+    _volc_check(http_code, resp_headers, body, args.volc_resource_id)
+    print(f"  asr: submitted task {task_id}", flush=True)
+
+    deadline = time.time() + 25.0
+    while time.time() < deadline:
+        time.sleep(0.5)
+        q_headers = _volc_auth_headers(args, task_id)
+        q_http, q_headers_resp, q_body = _volc_post(VOLC_QUERY_URL, q_headers, {})
+        q_status = q_headers_resp.get("X-Api-Status-Code", "") if q_headers_resp else ""
+        if q_status in ("20000001", "20000002"):   # processing / queued
+            continue
+        if q_status == "20000003":   # 任务完成，但没有检测到有效语音
+            return ""
+        _volc_check(q_http, q_headers_resp, q_body, args.volc_resource_id)
+        try:
+            data = json.loads(q_body or b"{}")
+        except Exception as e:
+            raise VolcError(f"火山查询返回不是 JSON: {q_body[:200]!r}") from e
+        return str((data.get("result") or {}).get("text") or "").strip()
+    raise VolcError("火山识别超时（25 秒），请重试或缩短录音")
+
+
+def volc_transcribe(wav_bytes: bytes, args: argparse.Namespace) -> str:
+    if args.volc_resource_id in VOLC_STANDARD_RESOURCES:
+        return volc_transcribe_standard(wav_bytes, args)
+    return volc_transcribe_flash(wav_bytes, args)
+
+
+def send_backspaces(count: int) -> bool:
+    """向当前前台窗口连发 count 次 Backspace。
+
+    逐次注入而不是拼成一批：目标程序每收到一个字符都会更新光标/行高，
+    留 8ms 让它处理完再发下一个，长文本时比一次性塞进去更稳。
+    """
+    for _ in range(count):
+        if not send_key(VK_BACK):
+            return False
+        time.sleep(0.008)
+    return True
+
+
+def paste_text(text: str, args: argparse.Namespace) -> tuple[bool, str, str, int]:
+    """把文字粘贴到当前前台窗口。返回 (ok, exe, 说明, hwnd)。"""
+    if os.name != "nt":
+        return False, "", "paste is Windows-only", 0
+    hwnd, exe, title = foreground_app()
+    if not hwnd:
+        return False, exe, "no foreground window", 0
+    if args.asr_app:
+        allow = [a.lower() for a in args.asr_app]
+        ok = any(exe == a or (not a.endswith(".exe") and exe == a + ".exe")
+                 for a in allow)
+        if not ok:
+            return False, exe, f"foreground {exe or '?'} not in --asr-app", int(hwnd)
+
+    prev = clipboard_get_text() if args.restore_clipboard else None
+    if not clipboard_set_text(text):
+        return False, exe, "clipboard write failed", int(hwnd)
+    time.sleep(0.05)
+    if not send_ctrl_v():
+        return False, exe, "SendInput Ctrl+V failed", int(hwnd)
+
+    if args.restore_clipboard and prev is not None:
+        def restore() -> None:
+            time.sleep(0.6)
+            clipboard_set_text(prev)
+        threading.Thread(target=restore, daemon=True).start()
+    return True, exe, title, int(hwnd)
+
+
 def load_devices(path) -> list[str]:
     try:
         with open(path, encoding="utf-8") as f:
@@ -284,6 +608,9 @@ class Bridge:
         self.device_seen = 0.0
         self.last_push_seq = -1
         self.act_lock = threading.Lock()   # 两次按键注入不能交错
+        # 最近一次成功粘贴：清空接口要知道删多少字符、删在哪个窗口。只在
+        # act_lock 内读写；桥接重启后为空，此时长按 BOOT 会提示没有可清空的内容。
+        self.last_paste: dict | None = None
         self.udp_out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.state_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), STATE_FILE)
         self.known_devices = load_devices(self.state_path)
@@ -344,6 +671,126 @@ class Bridge:
                 return 500, {"ok": False, "error": "SendInput failed"}
             print(f"  act {name} -> {exe} ({title[:40]!r})", flush=True)
             return 200, {"ok": True, "action": name, "app": exe, "title": title[:80]}
+
+    # ── 语音输入 ──
+    def asr(self, body: bytes, headers, raw_path: str) -> tuple[int, dict]:
+        """校验令牌，PCM -> WAV，火山识别，再把结果粘贴到前台窗口。"""
+        if not self.args.act_token:
+            return 403, {"ok": False, "error": "asr disabled: no act_token"}
+        q = parse_qs(urlsplit(raw_path).query)
+        tok = (q.get("tok") or [""])[0]
+        if not hmac.compare_digest(tok.encode("utf-8", "replace"),
+                                   self.args.act_token.encode("utf-8")):
+            return 403, {"ok": False, "error": "bad token"}
+        if not body:
+            return 400, {"ok": False, "error": "empty audio"}
+
+        try:
+            rate = int(headers.get("X-Sample-Rate", "16000"))
+            channels = int(headers.get("X-Channels", "1"))
+            bits = int(headers.get("X-Bits", "16"))
+        except (TypeError, ValueError):
+            return 400, {"ok": False, "error": "bad audio headers"}
+        if not (8000 <= rate <= 48000) or channels not in (1, 2) or bits != 16:
+            return 400, {"ok": False, "error": "unsupported audio format"}
+        if len(body) % (channels * 2) != 0:
+            return 400, {"ok": False, "error": "partial audio frame"}
+
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(channels)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(body)
+        wav_bytes = buf.getvalue()
+        if self.args.asr_save_wav:
+            try:
+                with open(self.args.asr_save_wav, "wb") as f:
+                    f.write(wav_bytes)
+                print(f"  asr: saved {len(wav_bytes)}B -> {self.args.asr_save_wav}",
+                      flush=True)
+            except OSError as e:
+                print(f"  asr: cannot save wav: {e}", flush=True)
+
+        print(f"  asr: {len(body)}B pcm {rate}Hz/{channels}ch -> volcengine", flush=True)
+        try:
+            if self.args.asr_mock_text:
+                text = self.args.asr_mock_text
+            else:
+                text = volc_transcribe(wav_bytes, self.args)
+        except VolcError as e:
+            print(f"  asr failed: {e}", flush=True)
+            return 502, {"ok": False, "error": str(e)[:240]}
+        if not text:
+            return 200, {"ok": False, "error": "empty transcript"}
+
+        if self.args.asr_dry_run:
+            print(f"  asr dry-run: {len(text)} chars: {text[:60]!r}", flush=True)
+            return 200, {"ok": True, "text": text, "dry_run": True}
+
+        with self.act_lock:
+            ok, exe, title, hwnd = paste_text(text, self.args)
+            if ok:
+                self.last_paste = {
+                    "chars": len(text),
+                    "hwnd": hwnd,
+                    "exe": exe,
+                    "title": title,
+                    "at": time.time(),
+                }
+        if not ok:
+            print(f"  asr paste failed: {title}", flush=True)
+            return 409, {"ok": False, "error": title, "text": text}
+        print(f"  asr: {len(text)} chars -> {exe} ({title[:40]!r})", flush=True)
+        return 200, {"ok": True, "text": text, "app": exe}
+
+    # ── 清空最近一次粘贴 ──
+    def clear_last(self, raw_path: str) -> tuple[int, dict]:
+        """把最近一次语音粘贴的文字删掉（按字符数逐字发 Backspace）。
+
+        只在"同一个前台窗口"里生效：用户如果已经切走，回删就落到别的程序
+        里了，所以宁可拒绝。清空成功后忘掉这次粘贴，再长按不会继续删更早
+        的文字。
+        """
+        if not self.args.act_token:
+            return 403, {"ok": False, "error": "clear disabled: no act_token"}
+        q = parse_qs(urlsplit(raw_path).query)
+        tok = (q.get("tok") or [""])[0]
+        if not hmac.compare_digest(tok.encode("utf-8", "replace"),
+                                   self.args.act_token.encode("utf-8")):
+            return 403, {"ok": False, "error": "bad token"}
+        if os.name != "nt":
+            return 501, {"ok": False, "error": "key injection is Windows-only"}
+
+        with self.act_lock:
+            lp = self.last_paste
+            if not lp:
+                return 409, {"ok": False, "error": "没有可清空的输入"}
+            if time.time() - lp["at"] > CLEAR_TTL_SEC:
+                self.last_paste = None
+                return 409, {"ok": False,
+                             "error": f"上次输入已超过 {CLEAR_TTL_SEC // 60} 分钟，无法清空"}
+            hwnd, exe, title = foreground_app()
+            if not hwnd:
+                return 409, {"ok": False, "error": "没有前台窗口"}
+            if int(hwnd) != lp["hwnd"]:
+                return 409, {"ok": False,
+                             "error": "前台窗口已切换，请切回刚才的窗口"}
+            n = int(lp["chars"])
+            if n <= 0 or n > CLEAR_MAX_CHARS:
+                return 409, {"ok": False, "error": "上次输入长度异常，无法清空"}
+
+            if self.args.asr_dry_run:
+                print(f"  clear dry-run: would delete {n} chars "
+                      f"from {exe} ({title[:40]!r})", flush=True)
+                return 200, {"ok": True, "chars": n, "dry_run": True}
+            if not send_backspaces(n):
+                print(f"  clear failed: SendInput returned an error "
+                      f"(foreground={exe})", flush=True)
+                return 500, {"ok": False, "error": "SendInput failed"}
+            self.last_paste = None
+            print(f"  clear: {n} chars <- {exe} ({title[:40]!r})", flush=True)
+            return 200, {"ok": True, "chars": n, "app": exe, "title": title[:80]}
 
     # ── ingress ──
     def ingest(self, payload: bytes) -> None:
@@ -608,8 +1055,30 @@ def make_handler(bridge: Bridge):
                 code, payload = bridge.act(self.path)
                 self._send(json.dumps(payload, ensure_ascii=False).encode(),
                            "application/json", code)
+            elif path == "/clear":
+                code, payload = bridge.clear_last(self.path)
+                self._send(json.dumps(payload, ensure_ascii=False).encode(),
+                           "application/json", code)
             else:
                 self._send(b"not found", "text/plain", 404)
+
+        def do_POST(self) -> None:  # noqa: N802
+            path = urlsplit(self.path).path
+            if path != "/asr":
+                self._send(b"not found", "text/plain", 404)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except (TypeError, ValueError):
+                length = 0
+            if length <= 0 or length > ASR_MAX_BYTES:
+                self._send(json.dumps({"ok": False, "error": "bad length"}).encode(),
+                           "application/json", 413)
+                return
+            body = self.rfile.read(length)
+            code, payload = bridge.asr(body, self.headers, self.path)
+            self._send(json.dumps(payload, ensure_ascii=False).encode(),
+                       "application/json", code)
 
         def log_message(self, fmt: str, *args) -> None:
             pass  # the device polls every second; keep the console for events
@@ -667,11 +1136,40 @@ def main() -> int:
     ap.add_argument("--act-dry-run", action="store_true",
                     help="authenticate and check the foreground window, but do not "
                          "send any key (safe way to test the setup)")
+    ap.add_argument("--volc-api-key", default=None, metavar="KEY",
+                    help="Volcengine ASR API key (new console). Defaults to "
+                         f"VOLC_API_KEY or the {VOLC_KEY_FILE} file next to this script")
+    ap.add_argument("--volc-app-key", default=os.environ.get("VOLC_APP_KEY", ""),
+                    help="legacy Volcengine App Key (used with --volc-access-key)")
+    ap.add_argument("--volc-access-key", default=os.environ.get("VOLC_ACCESS_KEY", ""),
+                    help="legacy Volcengine Access Key")
+    ap.add_argument("--volc-resource-id",
+                    default=os.environ.get("VOLC_RESOURCE_ID", VOLC_RESOURCE_DEFAULT),
+                    help="Volcengine resource id (default standard 2.0 "
+                         f"{VOLC_RESOURCE_DEFAULT}; standard 1.0 volc.bigasr.auc; "
+                         "flash volc.bigasr.auc_turbo)")
+    ap.add_argument("--volc-language", default=os.environ.get("VOLC_LANGUAGE", "zh-CN"),
+                    help="ASR language for flash mode (default zh-CN); "
+                         "standard mode auto-detects")
+    ap.add_argument("--asr-app", action="append", default=[], metavar="EXE",
+                    help="only paste when the foreground exe matches (repeatable; "
+                         "default: any window)")
+    ap.add_argument("--asr-dry-run", action="store_true",
+                    help="recognize but do not paste (test the ASR path)")
+    ap.add_argument("--asr-mock-text", default="", metavar="TEXT",
+                    help="skip Volcengine and return this text (setup testing)")
+    ap.add_argument("--asr-save-wav", default="", metavar="PATH",
+                    help="save the last received WAV to this path (debug)")
+    ap.add_argument("--no-restore-clipboard", dest="restore_clipboard",
+                    action="store_false",
+                    help="leave the transcript in the clipboard after pasting")
+    ap.set_defaults(restore_clipboard=True)
     args = ap.parse_args()
 
     if args.act_app is None:
         args.act_app = list(DEFAULT_ACT_APPS)
     args.act_token = load_act_token(args.act_token)
+    args.volc_api_key = load_volc_key(args.volc_api_key)
 
     # 输出重定向到文件时 Python 默认块缓冲：横幅（设备要填的地址、防火墙命令）
     # 会卡在缓冲区里，tail 日志的人看不到。整个脚本就是给人看的，改行缓冲。
@@ -748,6 +1246,22 @@ def main() -> int:
               f"{' (dry run)' if args.act_dry_run else ''}")
     else:
         print(f"  act           disabled (create {ACT_TOKEN_FILE} or pass --act-token)")
+
+    asr_ready = bool(args.volc_api_key or (args.volc_app_key and args.volc_access_key))
+    asr_mode = ("standard" if args.volc_resource_id in VOLC_STANDARD_RESOURCES
+                else "flash")
+    asr_lang = args.volc_language if asr_mode == "flash" else "auto"
+    if not args.act_token:
+        print(f"  asr           disabled (device auth needs {ACT_TOKEN_FILE})")
+    elif args.asr_mock_text:
+        print(f"  asr           MOCK -> {args.asr_mock_text!r}"
+              f"{' (dry run)' if args.asr_dry_run else ''}")
+    elif not asr_ready:
+        print(f"  asr           waiting for {VOLC_KEY_FILE} / VOLC_API_KEY")
+    else:
+        print(f"  asr           volcengine {asr_mode} {args.volc_resource_id} "
+              f"({asr_lang})"
+              f"{' (dry run)' if args.asr_dry_run else ''}")
     print(f"  if the device cannot reach it, allow the ports once (admin cmd):")
     print(f"    netsh advfirewall firewall add rule name=\"ZCode agent bridge\" "
           f"dir=in action=allow protocol=TCP localport={args.http_port} profile=private")

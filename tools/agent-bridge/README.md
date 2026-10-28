@@ -8,6 +8,7 @@ ZCode 进程 ──hook(stdio)──> zcode-hook.py ──UDP 本机──> brid
                                           HTTP /agent 轮询 │  ← 设备每秒取一次（1 秒延迟保底）
                                           UDP 推送         │  ← 状态一变立刻推（亚秒级）
                                           UDP 发现应答      │  ← 设备喊一句"桥接在哪"，这里答
+                                          POST /asr (PCM)  │  ← BOOT 录音 → 火山识别 → 粘贴
                                                           ▼
                                                    ESP32 Agent 状态页
 ```
@@ -155,16 +156,48 @@ python bridge.py --announce-to 192.168.1.50     # 板子当前的 IP，喊一次
 - `stale`：桥接自己认为这个状态已经不可信
 - `seq`：每次事件自增，便于判断是否漏包
 
+### 语音接口 `POST /asr`
+
+设备把 16 kHz / 16 bit / 单声道 PCM 直接放在请求体里：
+
+```text
+POST /asr?tok=<act_token>
+Content-Type: application/octet-stream
+X-Sample-Rate: 16000
+X-Channels: 1
+X-Bits: 16
+```
+
+桥接补 WAV 头 → 火山识别 → 剪贴板 + Ctrl+V。成功返回
+`{"ok":true,"text":"..."}`；识别失败返回 502，粘贴失败返回 409。
+令牌与 `/act` 共用 `act.token`。
+
+### 清空接口 `GET /clear`
+
+长按设备 BOOT 0.9 秒会调用它，把**最近一次粘贴**的文字逐字回删（按字符数发
+Backspace）：
+
+```text
+GET /clear?tok=<act_token>
+```
+
+成功返回 `{"ok":true,"chars":12}`。为了不删错东西，桥接只在同时满足以下条件时
+才动作，否则返回 409 并带中文原因：
+
+- 它是本次桥接进程里最近一次成功的 `/asr` 粘贴，且距粘贴不超过 2 分钟；
+- 当前前台窗口和当时粘贴的窗口是同一个（用户切走窗口后必须先切回来）；
+- 上次粘贴的字符数在 1～1000 之间。
+
+清空成功后桥接忘掉这次粘贴，再长按不会继续删更早的文字。`--asr-dry-run` 下
+只打印将要删除的字数，不真的按键。
+
 ### 动作接口 `/act`（按键页，实验性）
 
 固件里有一页「按键」（默认隐藏），用物理键触发：**IO18 短按 = 回车，IO18 长按
-0.7 秒 = Esc，BOOT 短按 = 右 Alt**。它是目前唯一会让 PC **产生动作**的接口，
-所以和只读的 `/agent` 分开设计：
+0.7 秒 = Esc**。BOOT 现在固定用于语音输入（见下一节），不再发右 Alt；`/act`
+仍保留 `ralt` 动作给旧固件或手动调用。
 
-> **右 Alt 的例外**：固件优先用 **BLE HID**（把自己枚举成真实蓝牙键盘）发右 Alt，
-> 只有未配对/未连接时才回退到这里的 `/act?name=ralt`。豆包输入法等程序会过滤
-> SendInput 注入的键（低级钩子里的 `LLKHF_INJECTED`），桥接的右 Alt 对它们无效；
-> 回车/Esc 不受影响，仍然走桥接。
+它是会让 PC **产生动作**的接口，所以和只读的 `/agent` 分开设计：
 
 - **token 必填**，只接受预定义动作 `name=enter` / `name=esc` / `name=ralt`；
 - **默认只允许前台窗口属于 `zcode.exe`**——按键触发的那一刻焦点不可控，
@@ -191,10 +224,9 @@ pio run -t uploadfs
 所有请求。
 
 设备上的页面要手动打开：**双击 PWR →「按键页」→ BOOT 切换 →「完成」**。
-打开后 IO18 / BOOT 的按键动作在任意页面都生效（设置页 / WiFi 配置页里它们要
-选行，不触发动作）。按键页关闭时 BOOT 短按仍是 WiFi 配置快捷入口；打开后
-WiFi 配置从设置页的「WiFi 配置」行进入。它是实验性功能，默认关闭，不影响其他页
-和用量抓取。
+打开后 IO18 的按键动作在任意页面都生效（设置页 / WiFi 配置页里它要选行，
+不触发动作）。BOOT 不参与按键页：它在主界面固定是语音输入，在设置页 / WiFi
+配置页里仍用于确认和输入。按键页默认关闭，不影响其他页和用量抓取。
 
 `GET /act?name=enter|esc|ralt&tok=<token>` 的返回：
 
@@ -226,6 +258,102 @@ curl "http://127.0.0.1:8787/act?name=enter&tok=$(cat act.token)"
 已知限制（与 Windows 的注入机制有关，不是桥接的 bug）：桥接以普通权限运行时，
 按键进不了管理员窗口；UAC 弹窗和锁屏是安全桌面，永远到不了。焦点在浏览器、
 编辑器里时，回车就是那个程序收到回车——这正是默认白名单要挡住的情况。
+
+## 语音输入（BOOT）
+
+按下设备右侧的 **BOOT** 开始录音，再按一次结束。设备把音频 POST 到桥接的
+`/asr`，桥接调用火山「大模型录音文件识别」，识别结果用剪贴板 + Ctrl+V 粘贴到
+**PC 当前前台窗口**的光标处。**长按 BOOT 0.9 秒**则调用 `/clear`，把刚才粘贴的
+那段文字逐字回删（详见上一节的清空接口）。
+
+> 完整的控制台开通步骤、标准版/极速版区别、请求字段和错误码见
+> [docs/volcengine-asr.md](../../docs/volcengine-asr.md)。
+
+```text
+BOOT 短按 ──> ES7210 采 16 kHz / 16 bit 单声道 ──> PSRAM
+BOOT 再按 ──> POST /asr（PCM）──> bridge.py ──> 火山 ASR ──> 剪贴板 + Ctrl+V
+BOOT 长按 ──> GET /clear ──> bridge.py 按上次字符数逐字发 Backspace
+```
+
+设备端一次最长 60 秒；录音短于 0.1 秒会提示「录音太短」。录音/识别期间屏幕
+会被语音界面接管，结束后回到原来的页面。
+
+### 配置火山
+
+在 `tools/agent-bridge/` 下创建 `volc.key`，一行放火山语音识别的 API Key：
+
+```bash
+# 从示例复制，再把第一行替换成真实 Key
+cp tools/agent-bridge/volc.key.example tools/agent-bridge/volc.key
+# 或者直接写
+printf '你的火山APIKey\n' > tools/agent-bridge/volc.key
+```
+
+也可以改用环境变量 `VOLC_API_KEY`，或启动参数 `--volc-api-key`。旧版控制台的
+App Key + Access Key 也支持：`--volc-app-key` + `--volc-access-key`。
+
+资源 ID 决定走哪套接口：
+
+| 资源 ID | 接口 | 说明 |
+|---|---|---|
+| `volc.seedasr.auc` | 标准版 2.0：提交 + 轮询查询 | **默认**；短音频通常 1~3 秒，语言自动识别 |
+| `volc.bigasr.auc` | 标准版 1.0：提交 + 轮询查询 | 老账号用；同样异步 |
+| `volc.bigasr.auc_turbo` | 极速版 flash：同步返回 | 延迟最低；需要单独开通极速版 |
+
+标准版是异步任务：桥接先 `submit` 再每 0.5 秒 `query`，最多等 25 秒。短句一般
+1~3 秒出结果；60 秒长录音可能更久。极速版一次请求直接返回，延迟更低。
+
+标准版不传语言，模型自动识别中文/英文/方言；极速版用 `--volc-language` 指定，
+默认 `zh-CN`。改资源 ID 或语言需要重启桥接；只换 Key 不需要。
+
+`volc.key` 已加入 `.gitignore`，不会被提交。密钥只在 PC 上，固件里没有。
+
+### 使用
+
+1. 桥接正常运行（`python bridge.py`，端口 8787）。
+2. 在 PC 上点一下目标输入框，让光标停在那里。
+3. 短按 BOOT 开始说话，屏幕显示「正在录音」和电平条；再短按 BOOT 结束。
+4. 屏幕显示「正在识别」→「已输入到电脑」，文字出现在输入框里。
+5. 如果这段文字不想要，**长按 BOOT 0.9 秒**（保持前台窗口不变），屏幕显示
+   「已清空 · 已删除 N 个字符」，输入框里刚才那段文字被逐字删除。
+
+设备 `data/config.json` 里的 `act_token` 必须和桥接的 `act.token` 一致
+（语音接口和 `/act` 共用同一个令牌）。
+
+### 不接火山也能测
+
+没有 API Key 时，可以用 mock 文本验证设备 → 桥接 → 返回这条链路：
+
+```bash
+python bridge.py --asr-mock-text "语音测试成功" --asr-dry-run
+```
+
+`--asr-dry-run` 只识别不粘贴，不会动你的前台窗口。去掉它就会真的粘贴。
+
+### 相关参数
+
+| 参数 | 作用 |
+|---|---|
+| `--asr-app notepad.exe` | 只在前台是该程序时粘贴（可重复；默认任意窗口） |
+| `--no-restore-clipboard` | 粘贴后不恢复原来的剪贴板（默认恢复） |
+| `--asr-dry-run` | 识别但不粘贴 |
+| `--asr-mock-text "..."` | 跳过火山，直接返回这段文字 |
+| `--asr-save-wav out.wav` | 把最近一次收到的音频存成 WAV（排查麦克风用） |
+
+### 排查
+
+| 现象 | 原因 |
+|---|---|
+| 设备显示「没找到电脑桥接」 | 桥接没跑 / 防火墙 / 不在同一网段（和 `/agent` 同一套发现） |
+| 设备显示「未配置 act_token」 | 设备 `data/config.json` 里没有 `act_token`，或值为空 |
+| 设备显示「没有配置火山 API Key」 | `volc.key` / `VOLC_API_KEY` 没读到；改完要重启桥接 |
+| 设备显示「火山未授权 45000030…」 | Key 有效，但账号没开通对应资源：标准版 2.0 用 `volc.seedasr.auc`，极速版用 `volc.bigasr.auc_turbo`；去语音技术控制台开通/授权 |
+| 设备显示「没有识别到文字」 | 录到的是静音，或火山返回空结果 |
+| 文字没进输入框 | 按 BOOT 前光标不在输入框；桥接日志有 `asr paste failed` 和前台程序名 |
+| 桥接日志 502 | 火山 Key、资源 ID 或语言配置不对，错误信息带 `X-Api-Status-Code` |
+
+> 局域网里的 `/asr` 和 `/agent` 都是明文（只有令牌校验，没有加密）。不要在
+> 不可信的网络里长期开着；云 API 密钥只在 PC 上，设备端拿不到它。
 
 ## 事件到状态的映射
 
