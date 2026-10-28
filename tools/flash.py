@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import re
 import subprocess
 import sys
@@ -21,8 +22,9 @@ import urllib.request
 from pathlib import Path
 
 REPO = "2700zc/esp32-usage-monitor"
-ASSET_URL = f"https://github.com/{REPO}/releases/latest/download/full.bin"
-SHA_URL = ASSET_URL + ".sha256"
+API_LATEST = f"https://api.github.com/repos/{REPO}/releases/latest"
+# github.com 在国内经常连不上，而 api.github.com 通常可用；资产下载统一走 API。
+USER_AGENT = "esp32-usage-monitor-flash"
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent
 DEFAULT_LOCAL = REPO_ROOT / "dist" / "full.bin"
@@ -43,6 +45,27 @@ def sha256(path: Path) -> str:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _fetch(url: str, timeout: int, accept: str = "application/octet-stream") -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": accept})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def release_assets(names: list[str]) -> dict[str, str]:
+    """一次取回 latest release 的资产地址；公开仓库不需要 token。"""
+    try:
+        release = json.loads(_fetch(API_LATEST, 30, "application/vnd.github+json"))
+    except Exception as e:  # noqa: BLE001
+        raise Die(f"查询 GitHub Release 失败：{e}\n请手动下载 full.bin，或用 --file 指定路径。") from e
+
+    by_name = {a.get("name"): a["url"] for a in release.get("assets", [])}
+    missing = [n for n in names if n not in by_name]
+    tag = release.get("tag_name", "")
+    if missing:
+        raise Die(f"Release {tag} 里没有 {', '.join(missing)}，请手动下载或用 --file 指定路径。")
+    return {n: by_name[n] for n in names}
 
 
 def esptool_cmd(no_install: bool) -> tuple[list[str], int]:
@@ -93,10 +116,12 @@ def find_image(explicit: str | None, no_install: bool) -> tuple[Path, bool]:
     dest = DEFAULT_LOCAL
     dest.parent.mkdir(parents=True, exist_ok=True)
     try:
-        with urllib.request.urlopen(ASSET_URL, timeout=60) as r, dest.open("wb") as f:
-            f.write(r.read())
-        with urllib.request.urlopen(SHA_URL, timeout=30) as r:
-            expected = r.read().decode("utf-8", "replace").split()[0].lower()
+        urls = release_assets(["full.bin", "full.bin.sha256"])
+        dest.write_bytes(_fetch(urls["full.bin"], 120))
+        expected = _fetch(urls["full.bin.sha256"], 30).decode("utf-8", "replace").split()[0].lower()
+    except Die:
+        dest.unlink(missing_ok=True)
+        raise
     except Exception as e:  # noqa: BLE001
         dest.unlink(missing_ok=True)
         raise Die(f"下载失败：{e}\n请手动下载 full.bin，或用 --file 指定路径。") from e
